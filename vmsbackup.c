@@ -432,13 +432,6 @@ static void vmb_ctx_reset(struct vmb_ctx *ctx)
 	memset(ctx, 0, sizeof(*ctx));
 }
 
-static struct vmb_ctx *ctx_from_file(struct file_details *f)
-{
-	/* file_details is the first field of vmb_ctx; derive the owner */
-	char *base = (char *)f;
-	return (struct vmb_ctx *)(base - offsetof(struct vmb_ctx, file));
-}
-
 /*
  * Someday, one might want to make MAX_BUFFCOUNT dynamic and get the actual
  * value from the /BUFF field of the backup command (as reported in the
@@ -489,6 +482,328 @@ static unsigned int getu16 ( struct vmb_ctx *ctx, unsigned char *addr )
 
 #define GETU16(ctx,x) getu16( ctx, (unsigned char *)&(x) )
 
+
+/**
+ * Dump the contents (indicies only) of the busy and free queues.
+ *
+ * @param which Bitmask of which queue to dump.
+ * 	@arg 1 Dump the busy queue
+ * 	@arg 2 Dump the free queue
+ *
+ * @return nothing
+ */
+
+static void dump_queues( struct vmb_ctx *ctx, int which )
+{
+	if ( (ctx->vflag&VERB_QUEUE_LVL) )
+	{
+		int idx;
+		struct buff_ctl *bptr;
+		if ( (which&1) )
+		{
+			printf( "\tBusy queue (%d): ", ctx->busybuffs );
+			idx = ctx->busybuffs;
+			while ( idx )
+			{
+				printf( "%d ", idx );
+				bptr = ctx->buffers + idx;
+				idx = bptr->next;
+			}
+			printf( "\n" );
+		}
+		if ( (which&2) )
+		{
+			printf( "\tFree queue (%d): ", ctx->freebuffs );
+			idx = ctx->freebuffs;
+			while ( idx )
+			{
+				printf( "%d ", idx );
+				bptr = ctx->buffers + idx;
+				idx = bptr->next;
+			}
+			printf( "\n" );
+		}
+	}
+}
+
+/**
+ * Pop top item off busy queue
+ *
+ * @return Pointer to item or 0 if nothing available.
+ */
+
+static struct buff_ctl *popbusy_buff(struct vmb_ctx *ctx)
+{
+	struct buff_ctl *bptr;
+	if ( !ctx->busybuffs )
+	{
+		if ( (ctx->vflag&VERB_QUEUE_LVL) )
+		{
+			printf( "popbusy_buff(): No items on queue.\n" );
+			dump_queues(ctx, 3 );
+		}
+		return NULL;
+	}
+	bptr = ctx->buffers + ctx->busybuffs;
+	ctx->busybuffs = bptr->next;
+	bptr->next = 0;
+	--ctx->num_busys;
+	if ( (ctx->vflag&VERB_QUEUE_LVL) )
+	{
+		printf( "popbusy_buff(): popped %ld off busy queue. num_busys now %d\n",
+				(long)(bptr-ctx->buffers), ctx->num_busys );
+		dump_queues(ctx, 3 );
+	}
+	return bptr;
+}
+
+/**
+ * Add item to busy queue.
+ *
+ * @param bptr Pointer to item.
+ * @param front Flag indicating where to add.
+ *	@arg 0 Append to end of list.
+ *	@arg 1 Prepend to front of list.
+ *
+ * @return nothing
+ */
+
+static void add_busybuff( struct vmb_ctx *ctx, struct buff_ctl *bptr, int front ) 
+{
+	int prev, ii;
+
+	++ctx->num_busys;
+	if ( (ctx->vflag&VERB_QUEUE_LVL) )
+	{
+		printf( "add_busybuff(): Added item %ld to %s of busy queue. num_busys now %d\n",
+				(long)(bptr - ctx->buffers), front ? "head" : "tail", ctx->num_busys );
+	}
+	if ( front )
+	{
+		bptr->next = ctx->busybuffs;
+		ctx->busybuffs = bptr-ctx->buffers;
+	}
+	else
+	{
+		prev = 0;
+		ii = ctx->busybuffs;
+		bptr->next = 0;		/* make sure this is off */
+		while ( ii )		/* walk the chain */
+		{
+			prev = ii;		/* remember this */
+			ii = ctx->buffers[ii].next;	/* advance to next */
+		}
+		if ( prev )			/* if there was a chain */
+			ctx->buffers[prev].next = bptr-ctx->buffers; /* link it */
+		else
+			ctx->busybuffs = bptr-ctx->buffers; /* else we are on top */
+	}
+	dump_queues(ctx, 3 );
+}
+
+/**
+ * Get an item from free queue.
+ *
+ * @return Pointer to item or NULL if free queue empty.
+ */
+
+static struct buff_ctl *getfree_buff(struct vmb_ctx *ctx)
+{
+	struct buff_ctl *bptr;
+	if ( !ctx->freebuffs )
+	{
+		if ( (ctx->vflag&VERB_QUEUE_LVL) )
+		{
+			printf( "getfree_buff(): Nothing on free list!!! num_busys now %d\n", ctx->num_busys );
+			dump_queues(ctx, 3 );
+		}
+		return NULL;
+	}
+	bptr = ctx->buffers + ctx->freebuffs;
+	ctx->freebuffs = bptr->next;
+	bptr->next = 0;
+	bptr->amt = 0;
+	bptr->blknum = 0;
+	if ( (ctx->vflag&VERB_QUEUE_LVL) )
+	{
+		printf( "getfree_buff(): Extracted %ld from freelist. num_busys now %d\n",
+				(long)(bptr-ctx->buffers), ctx->num_busys );
+		dump_queues(ctx, 3 );
+	}
+	return bptr;
+}
+
+/**
+ * Put item back on free queue.
+ *
+ * @param bptr Pointer to item.
+ *
+ * @return nothing.
+ */
+
+static void free_buff( struct vmb_ctx *ctx, struct buff_ctl *bptr )
+{
+	if ( bptr )
+	{
+		bptr->next = ctx->freebuffs;
+		ctx->freebuffs = bptr - ctx->buffers;
+		if ( (ctx->vflag&VERB_QUEUE_LVL) )
+		{
+			printf( "free_buff(): Put %ld on freelist. num_busys now %d\n", (long)(bptr - ctx->buffers), ctx->num_busys );
+			dump_queues(ctx, 3 );
+		}
+	}
+}
+
+/** 
+ * Put all buffers back on free queue.
+ *
+ * @return nothing.
+ */
+
+static void freeall( struct vmb_ctx *ctx )
+{
+	if ( ctx->buffers )
+	{
+		struct buff_ctl *bp;
+		int ii;
+		bp = ctx->buffers+1;
+		for ( ii=1; ii < ctx->num_buffers-1; ++ii, ++bp )
+			bp->next = ii+1;
+		bp->next = 0;
+		ctx->freebuffs = 1;
+		ctx->busybuffs = 0;
+		if ( (ctx->vflag&VERB_QUEUE_LVL) )
+		{
+			printf( "freeall(): Free'd all buffers.\n" );
+			dump_queues(ctx, 3 );
+		}
+	}
+}
+
+/**
+ * Remove duplicate blocks from busy list.
+ *
+ * @return nothing.
+ */
+
+static void remove_dups( struct vmb_ctx *ctx )
+{
+	int ii, lim, jj;
+	struct buff_ctl *bptr, *la;
+	int buffs[MAX_BUFFCOUNT];		/* place to hold clone of buffer layout */
+
+	if ( ctx->num_busys <= 1 )
+		return;				/* nothing to do if there's only one item */
+	memset( buffs, 0, sizeof(buffs) );	/* preclear local array */
+	buffs[0] = ctx->busybuffs;
+	bptr = ctx->buffers + ctx->busybuffs;
+	lim = 1;
+	while ( lim < MAX_BUFFCOUNT && bptr->next )	/* clone the busy list to our local array */
+	{
+		buffs[lim++] = bptr->next;
+		la = ctx->buffers + bptr->next;
+		bptr = la;
+	}
+	if ( lim >= MAX_BUFFCOUNT && bptr->next )
+	{
+		printf( "Snark: fatal internal error. Too many items on buffer list.\n" );
+		ctx->skipping |= SKIP_TO_SAVESET;/* toss the remainder of this saveset */
+		return;
+	}
+	if ( lim != ctx->num_busys )
+	{
+		printf( "Snark: fatal internal error. busy list count (%d) != num_busys (%d).\n",
+				lim, ctx->num_busys );
+		ctx->skipping |= SKIP_TO_SAVESET;/* toss the remainder of this saveset */
+		return;
+	}
+	if ( lim == 2 && !bptr->amt )	/* only two items, but second is a tm */
+		return;/* so, nothing to do */
+/* First, check each entry for a duplicate entry */
+	if ( (ctx->vflag&VERB_QUEUE_LVL) )
+	{
+		printf( "Before checking for duplicates:\n\tBusy queue (?): " );
+		for ( ii=0; ii < lim; ++ii )
+			printf( "%d ", buffs[ii] );
+		printf( "\n\tblknums: " );
+		for ( ii=0; ii < lim; ++ii )
+		{
+			bptr = ctx->buffers + buffs[ii];
+			printf( "%7ld ", bptr->blknum );
+		}
+		printf( "\n" );
+		dump_queues(ctx, 2 );
+	}
+/*
+ * If there are duplicate blocks, the later one must win.
+ */
+	for ( ii=0; ii < lim-1; ++ii )	 /* for each item in busy list */
+	{
+		bptr = ctx->buffers + buffs[ii];
+		for ( jj=ii+1; jj < lim; ++jj )	 /* check to see if there's a like numbered one that came later */
+		{
+			la = ctx->buffers + buffs[jj];
+			if ( la->amt && la->blknum == bptr->blknum )
+			{
+				if ( (ctx->vflag&VERB_FILE_RDLVL) )
+					printf( "Found duplicate block numbered %ld. Discarded original.\n", bptr->blknum );
+				buffs[ii] = buffs[jj];	/* Just place the duplicate in the original's location */
+				if ( lim-jj > 1 )	/* and shift what's left (if any) up one spot */
+					memmove( buffs+jj, buffs+jj+1, (lim-jj-1) * sizeof(int) );
+				--ii;			/* conteract the outer for loop's ++ */
+				--lim;			/* shrink the total by 1 */
+				--ctx->num_busys;		/* reduce busy count too */
+				if ( (ctx->vflag&VERB_QUEUE_LVL) )
+				{
+					printf( "Found duplicate block numbered %ld. Discarding buffer %ld\n",
+						bptr->blknum, (long)(bptr-ctx->buffers) );
+					ctx->busybuffs = buffs[0]; /* fixup the busy que so it'll display correctly */
+					for ( jj=0; jj < lim-1; ++jj )
+					{
+						la = ctx->buffers + buffs[jj];
+						la->next = buffs[jj+1];
+					}
+					la = ctx->buffers + buffs[jj];
+					la->next = 0;
+				}
+				free_buff( ctx, bptr );	/* toss the original buffer */
+				break;		/* look again from the beginning */
+			}
+		}
+	}
+	if ( (ctx->vflag&VERB_QUEUE_LVL) )
+	{
+		printf( "After checking for duplicates:\n\tBusy queue (%d): ", ctx->busybuffs );
+		for ( ii=0; ii < lim; ++ii )
+			printf( "%d ", buffs[ii] );
+		printf( "\n\tblknums: " );
+		for ( ii=0; ii < lim; ++ii )
+		{
+			bptr = ctx->buffers + buffs[ii];
+			printf( "%7ld ", bptr->blknum );
+		}
+		printf( "\n" );
+		dump_queues(ctx, 2 );
+	}
+	/* Now check the busy list for holes */
+	for ( ii=0; ii < lim-1; ++ii )
+	{
+		bptr = ctx->buffers + buffs[ii];
+		la = ctx->buffers + buffs[ii+1];
+		if ( la->blknum-bptr->blknum > 1 )
+		{
+			printf( "Snark: missing block(s) %ld..%ld [%d missing].\n",
+					bptr->blknum+1, la->blknum-1, (int)(la->blknum - bptr->blknum - 1) );
+			if ( !ctx->eflag && !ctx->xflag )
+			{
+				ctx->skipping |= SKIP_TO_FILE;
+				return;/* abort during listing */
+			}
+		}
+	}
+}
+
 #define file (current_ctx->file)
 #define tapefile (current_ctx->tapefile)
 #define secs_adj (current_ctx->secs_adj)
@@ -528,337 +843,6 @@ static unsigned int getu16 ( struct vmb_ctx *ctx, unsigned char *addr )
 #define goptind (current_ctx->goptind)
 #define gargc (current_ctx->gargc)
 
-/**
- * Dump the contents (indicies only) of the busy and free queues.
- *
- * @param which Bitmask of which queue to dump.
- * 	@arg 1 Dump the busy queue
- * 	@arg 2 Dump the free queue
- *
- * @return nothing
- */
-
-static void dump_queues( int which )
-{
-	if ( (vflag&VERB_QUEUE_LVL) )
-	{
-		int idx;
-		struct buff_ctl *bptr;
-		if ( (which&1) )
-		{
-			printf( "\tBusy queue (%d): ", busybuffs );
-			idx = busybuffs;
-			while ( idx )
-			{
-				printf( "%d ", idx );
-				bptr = buffers + idx;
-				idx = bptr->next;
-			}
-			printf( "\n" );
-		}
-		if ( (which&2) )
-		{
-			printf( "\tFree queue (%d): ", freebuffs );
-			idx = freebuffs;
-			while ( idx )
-			{
-				printf( "%d ", idx );
-				bptr = buffers + idx;
-				idx = bptr->next;
-			}
-			printf( "\n" );
-		}
-	}
-}
-
-/**
- * Pop top item off busy queue
- *
- * @return Pointer to item or 0 if nothing available.
- */
-
-static struct buff_ctl *popbusy_buff(void)
-{
-	struct buff_ctl *bptr;
-	if ( !busybuffs )
-	{
-		if ( (vflag&VERB_QUEUE_LVL) )
-		{
-			printf( "popbusy_buff(): No items on queue.\n" );
-			dump_queues( 3 );
-		}
-		return NULL;
-	}
-	bptr = buffers + busybuffs;
-	busybuffs = bptr->next;
-	bptr->next = 0;
-	--num_busys;
-	if ( (vflag&VERB_QUEUE_LVL) )
-	{
-		printf( "popbusy_buff(): popped %d off busy queue. num_busys now %d\n",
-				bptr-buffers, num_busys );
-		dump_queues( 3 );
-	}
-	return bptr;
-}
-
-/**
- * Add item to busy queue.
- *
- * @param bptr Pointer to item.
- * @param front Flag indicating where to add.
- *	@arg 0 Append to end of list.
- *	@arg 1 Prepend to front of list.
- *
- * @return nothing
- */
-
-static void add_busybuff( struct buff_ctl *bptr, int front ) 
-{
-	int prev, ii;
-
-	++num_busys;
-	if ( (vflag&VERB_QUEUE_LVL) )
-	{
-		printf( "add_busybuff(): Added item %d to %s of busy queue. num_busys now %d\n",
-				bptr - buffers, front ? "head" : "tail", num_busys );
-	}
-	if ( front )
-	{
-		bptr->next = busybuffs;
-		busybuffs = bptr-buffers;
-	}
-	else
-	{
-		prev = 0;
-		ii = busybuffs;
-		bptr->next = 0;		/* make sure this is off */
-		while ( ii )		/* walk the chain */
-		{
-			prev = ii;		/* remember this */
-			ii = buffers[ii].next;	/* advance to next */
-		}
-		if ( prev )			/* if there was a chain */
-			buffers[prev].next = bptr-buffers; /* link it */
-		else
-			busybuffs = bptr-buffers; /* else we are on top */
-	}
-	dump_queues( 3 );
-}
-
-/**
- * Get an item from free queue.
- *
- * @return Pointer to item or NULL if free queue empty.
- */
-
-static struct buff_ctl *getfree_buff(void)
-{
-	struct buff_ctl *bptr;
-	if ( !freebuffs )
-	{
-		if ( (vflag&VERB_QUEUE_LVL) )
-		{
-			printf( "getfree_buff(): Nothing on free list!!! num_busys now %d\n", num_busys );
-			dump_queues( 3 );
-		}
-		return NULL;
-	}
-	bptr = buffers + freebuffs;
-	freebuffs = bptr->next;
-	bptr->next = 0;
-	bptr->amt = 0;
-	bptr->blknum = 0;
-	if ( (vflag&VERB_QUEUE_LVL) )
-	{
-		printf( "getfree_buff(): Extracted %d from freelist. num_busys now %d\n", bptr-buffers, num_busys );
-		dump_queues( 3 );
-	}
-	return bptr;
-}
-
-/**
- * Put item back on free queue.
- *
- * @param bptr Pointer to item.
- *
- * @return nothing.
- */
-
-static void free_buff( struct buff_ctl *bptr )
-{
-	if ( bptr )
-	{
-		bptr->next = freebuffs;
-		freebuffs = bptr - buffers;
-		if ( (vflag&VERB_QUEUE_LVL) )
-		{
-			printf( "free_buff(): Put %d on freelist. num_busys now %d\n", bptr - buffers, num_busys );
-			dump_queues( 3 );
-		}
-	}
-}
-
-/** 
- * Put all buffers back on free queue.
- *
- * @return nothing.
- */
-
-static void freeall( void )
-{
-	if ( buffers )
-	{
-		struct buff_ctl *bp;
-		int ii;
-		bp = buffers+1;
-		for ( ii=1; ii < num_buffers-1; ++ii, ++bp )
-			bp->next = ii+1;
-		bp->next = 0;
-		freebuffs = 1;
-		busybuffs = 0;
-		if ( (vflag&VERB_QUEUE_LVL) )
-		{
-			printf( "freeall(): Free'd all buffers.\n" );
-			dump_queues( 3 );
-		}
-	}
-}
-
-/**
- * Remove duplicate blocks from busy list.
- *
- * @return nothing.
- */
-
-static void remove_dups( void )
-{
-	int ii, lim, jj;
-	struct buff_ctl *bptr, *la;
-	int buffs[MAX_BUFFCOUNT];		/* place to hold clone of buffer layout */
-
-	if ( num_busys <= 1 )
-		return;				/* nothing to do if there's only one item */
-	memset( buffs, 0, sizeof(buffs) );	/* preclear local array */
-	buffs[0] = busybuffs;
-	bptr = buffers + busybuffs;
-	lim = 1;
-	while ( lim < MAX_BUFFCOUNT && bptr->next )	/* clone the busy list to our local array */
-	{
-		buffs[lim++] = bptr->next;
-		la = buffers + bptr->next;
-		bptr = la;
-	}
-	if ( lim >= MAX_BUFFCOUNT && bptr->next )
-	{
-		printf( "Snark: fatal internal error. Too many items on buffer list.\n" );
-		skipping |= SKIP_TO_SAVESET;	/* toss the remainder of this saveset */
-		return;
-	}
-	if ( lim != num_busys )
-	{
-		printf( "Snark: fatal internal error. busy list count (%d) != num_busys (%d).\n",
-				lim, num_busys );
-		skipping |= SKIP_TO_SAVESET;	/* toss the remainder of this saveset */
-		return;
-	}
-	if ( lim == 2 && !bptr->amt )	/* only two items, but second is a tm */
-		return;				/* so, nothing to do */
-/* First, check each entry for a duplicate entry */
-	if ( (vflag&VERB_QUEUE_LVL) )
-	{
-		printf( "Before checking for duplicates:\n\tBusy queue (?): " );
-		for ( ii=0; ii < lim; ++ii )
-			printf( "%d ", buffs[ii] );
-		printf( "\n\tblknums: " );
-		for ( ii=0; ii < lim; ++ii )
-		{
-			bptr = buffers + buffs[ii];
-			printf( "%7ld ", bptr->blknum );
-		}
-		printf( "\n" );
-		dump_queues( 2 );
-	}
-/*
- * If there are duplicate blocks, the later one must win.
- */
-	for ( ii=0; ii < lim-1; ++ii )	 /* for each item in busy list */
-	{
-		bptr = buffers + buffs[ii];
-		for ( jj=ii+1; jj < lim; ++jj )	 /* check to see if there's a like numbered one that came later */
-		{
-			la = buffers + buffs[jj];
-			if ( la->amt && la->blknum == bptr->blknum )
-			{
-				if ( (vflag&VERB_FILE_RDLVL) )
-					printf( "Found duplicate block numbered %ld. Discarded original.\n", bptr->blknum );
-				buffs[ii] = buffs[jj];	/* Just place the duplicate in the original's location */
-				if ( lim-jj > 1 )	/* and shift what's left (if any) up one spot */
-					memmove( buffs+jj, buffs+jj+1, (lim-jj-1) * sizeof(int) );
-				--ii;			/* conteract the outer for loop's ++ */
-				--lim;			/* shrink the total by 1 */
-				--num_busys;		/* reduce busy count too */
-				if ( (vflag&VERB_QUEUE_LVL) )
-				{
-					printf( "Found duplicate block numbered %ld. Discarding buffer %d\n",
-							bptr->blknum, bptr-buffers );
-					busybuffs = buffs[0]; /* fixup the busy que so it'll display correctly */
-					for ( jj=0; jj < lim-1; ++jj )
-					{
-						la = buffers + buffs[jj];
-						la->next = buffs[jj+1];
-					}
-					la = buffers + buffs[jj];
-					la->next = 0;
-				}
-				free_buff( bptr );	/* toss the original buffer */
-				break;			/* look again from the beginning */
-			}
-		}
-	}
-	if ( (vflag&VERB_QUEUE_LVL) )
-	{
-		printf( "After removing duplicates:\n\tBusy queue (?): " );
-		for ( ii=0; ii < lim; ++ii )
-			printf( "%d ", buffs[ii] );
-		printf( "\n" );
-		dump_queues( 2 );
-	}
-/*
- * There may be missing blocks, so we bubble sort what's left
- * in case that happens. The decoder will check for and decide
- * what to do about missing blocks.
- */
-	for ( ii=0; ii < num_busys-1; ++ii )
-	{
-		bptr = buffers + buffs[ii];
-		for ( jj=ii+1; jj < num_busys; ++jj )
-		{
-			la = buffers + buffs[jj];
-			if ( bptr->amt && bptr->blknum > la->blknum )
-			{
-				int sav = buffs[ii];
-				buffs[ii] = buffs[jj];
-				buffs[jj] = sav;
-				bptr = la;
-			}
-		}
-	}
-/* Now rebuild the linked busy list */
-	for ( ii=0; ii < num_busys-1; ++ii )
-	{
-		bptr = buffers + buffs[ii];
-		bptr->next = buffs[ii+1];
-	}
-	bptr = buffers + buffs[ii];
-	bptr->next = 0;
-	busybuffs = buffs[0];
-	if ( (vflag&VERB_QUEUE_LVL) )
-	{
-		printf( "After sorting:\n" );
-		dump_queues( 3 );
-	}
-}
 
 static int getRfmRatt(struct file_details *f, char *rcdFormat, int dstLen, char delim)
 {
@@ -1203,6 +1187,8 @@ int typecmp ( const char *str, int which )
 				return( 0 );   /* found a match, file to be ignored */
 		}
 	}
+	(void)ii;
+	(void)jj;
 	return 1;	   /* no match found keep file */
 }
 
@@ -2430,7 +2416,8 @@ static unsigned long get_block_number( unsigned char *bptr )
 	/* check the validity of the header block */
 	if ( bhsize != sizeof ( struct bbh ) )
 	{
-		printf ( "Snark: Invalid header block size. Expected %d, found %d\n", sizeof( struct bbh ), bhsize );
+				printf ( "Snark: Invalid header block size. Expected %zu, found %lu\n",
+						sizeof( struct bbh ), (unsigned long)bhsize );
 		return ans;
 	}
 	if ( bsize != 0 && bsize != (unsigned long)blocksize )
@@ -2827,7 +2814,7 @@ int rdhead ( void )
 	nfound = 1;
 	mstop = 3;				/* autostop when we get to 2 tm's */
 	last_block_number = 0;		/* start all blocks at 0 */
-	freeall();				/* free all the buffers */
+	freeall(current_ctx);				/* free all the buffers */
 
 	/* read the tape label - 4 records of 80 bytes */
 	while ( 1 )
@@ -2949,7 +2936,7 @@ int rdhead ( void )
 	if ( !nfound && blocksize && blocksize+16 > buffalloc )
 	{
 		alloc_buffers( MAX_BUFFCOUNT, blocksize );
-		freeall();
+		freeall(current_ctx);
 	}
 	return( nfound );
 }
@@ -3043,7 +3030,7 @@ static int read_next_block( )
 	{
 		if ( rdhead (  ) )	/* read header */
 			return NXT_BLK_EOT;	/* reached eot */
-		bptr = getfree_buff();
+		bptr = getfree_buff(current_ctx);
 		if ( !bptr )
 		{
 			printf( "Snark: Fatal internal error. No more free buffs.\n" );
@@ -3055,7 +3042,7 @@ static int read_next_block( )
 			bptr->amt = read_record( bptr->buffer, buffalloc );	/* fill first buffer */
 			if ( !bptr->amt )
 			{
-				free_buff( bptr );				/* put this back */
+				free_buff(current_ctx, bptr );				/* put this back */
 				return NXT_BLK_TM;				/* found tm */
 			}
 			if ( bptr->amt == blocksize )           /* block is ok so far */
@@ -3065,7 +3052,7 @@ static int read_next_block( )
 					continue;					/* not a valid block, skip it */
 				if ( numb0 != 1 )				/* it had better be a 1 */
 				{
-					free_buff( bptr );				/* put this back */
+					free_buff(current_ctx, bptr );				/* put this back */
 					return NXT_BLK_NOLEAD;			/* no leading block */
 				}
 				break;
@@ -3073,12 +3060,12 @@ static int read_next_block( )
 			printf ( "Snark: record size incorrect. read amt = %d, expected %d\n", bptr->amt, blocksize );
 		}
 		bptr->blknum = 1;					/* always starts with block 1 */
-		add_busybuff( bptr, 0 );				/* put this on the busy queue */
+		add_busybuff( current_ctx, bptr, 0 );				/* put this on the busy queue */
 	}
 	bptr = buffers+busybuffs;		/* point to top item on queue */
 	if ( !bptr->amt )			/* if top buffer is a TM */
 	{
-		free_buff( popbusy_buff() );	/* toss the top item */
+		free_buff(current_ctx, popbusy_buff(current_ctx) );	/* toss the top item */
 		return NXT_BLK_TM;		/* return eof */
 	}
 	while ( bptr->next )		/* find last item on busy queue */
@@ -3089,7 +3076,7 @@ static int read_next_block( )
 	{
 		for ( ra=num_busys; !hittm && ra < MAX_BUFFCOUNT; ++ra )	/* may need to readahead n buffers */
 		{
-			bptr = getfree_buff();		/* get a free buffer */
+			bptr = getfree_buff(current_ctx);		/* get a free buffer */
 			if ( !bptr )
 			{
 				printf( "Snark: Fatal internal error. Ran out of free buffs.\n" );
@@ -3115,16 +3102,16 @@ static int read_next_block( )
 						 bptr->amt, blocksize );
 			}
 			if ( !hittm )
-				add_busybuff( bptr, 0 );	/* append the buffer to busy queue */
+				add_busybuff( current_ctx, bptr, 0 );	/* append the buffer to busy queue */
 			else
-				free_buff( bptr );		/* toss this for now */
+				free_buff(current_ctx, bptr );		/* toss this for now */
 		}
-		remove_dups();				/* account for missing & duplicates in busy queue */
+		remove_dups(current_ctx);				/* account for missing & duplicates in busy queue */
 	}
 	if ( hittm )			/* if we've hit a TM */
 	{
-		bptr = getfree_buff();
-		add_busybuff( bptr, 0 );	/* stick a TM at end of busy queue */
+		bptr = getfree_buff(current_ctx);
+		add_busybuff( current_ctx, bptr, 0 );	/* stick a TM at end of busy queue */
 	}
 	return NXT_BLK_OK;			/* we've got a good record */
 }
@@ -3488,7 +3475,7 @@ static int vmsbackup_entry(struct vmb_ctx *ctx, int argc, char *argv[])
 			continue;
 		case NXT_BLK_TM:		/* reached a TM */
 			rdtail (  );		/* read EOF labels */
-			freeall();		/* reset for next saveset */
+			freeall(current_ctx);		/* reset for next saveset */
 			skipping = 0;		/* not skipping anything now */
 			eoffl = 0;
 			continue;		/* loop */
@@ -3500,12 +3487,12 @@ static int vmsbackup_entry(struct vmb_ctx *ctx, int argc, char *argv[])
 			++saveSet_errors;
 			skipping |= SKIP_TO_SAVESET;
 			skip_to_tm();
-			freeall();		/* reset for next saveset */
+			freeall(current_ctx);		/* reset for next saveset */
 			eoffl = 0;
 			continue;
 		case NXT_BLK_OK:
 			{
-				bptr = popbusy_buff();
+				bptr = popbusy_buff(current_ctx);
 				if ( bptr->blknum != last_block_number+1 )
 				{
 					printf( "Snark: block %ld out of sequence. Expected %ld\n",
@@ -3522,7 +3509,7 @@ static int vmsbackup_entry(struct vmb_ctx *ctx, int argc, char *argv[])
 		if ( bptr )
 		{
 			process_block ( bptr->buffer );
-			free_buff( bptr );
+			free_buff(current_ctx, bptr );
 		}
 	}
 	close_file();
