@@ -164,6 +164,7 @@
 #include	<string.h>
 #include	<strings.h>
 #include	<stdlib.h>
+#include	<stddef.h>
 #include	<unistd.h>
 #include	<getopt.h>
 #include	<time.h>
@@ -314,10 +315,6 @@ struct file_details
 	FileState_t file_state;
 } file;
 
-char *tapefile;
-
-time_t secs_adj;
-
 #define	FAB_dol_C_RAW	0	/* undefined */
 #define	FAB_dol_C_FIX	1	/* fixed-length record */
 #define	FAB_dol_C_VAR	2	/* variable-length record */
@@ -384,12 +381,6 @@ time_t secs_adj;
 #define SUMM_GROUPSIZE	(14)	/* /GROUP */
 #define SUMM_BUFFCOUNT	(15)	/* /BUFFER */
 
-int fd;				/* tape file descriptor */
-int cDelim, dflag, eflag, iflag, Iflag, lcflag, nflag, binaryFlag, tflag, vflag, wflag, xflag, Rflag, vfcflag;
-int setnr, selset, skipSet, numHdrs, saveSet_errors, total_errors;
-char selsetname[14];
-
-int skipping;			/*!< Bit mask of errors as described below */
 #define SKIP_TO_FILE	(1)	/*!< Skip to next file */
 #define SKIP_TO_BLOCK	(2)	/*!< Skip to next block */
 #define SKIP_TO_SAVESET	(4)	/*!< Skip to next saveset */
@@ -403,13 +394,50 @@ int skipping;			/*!< Bit mask of errors as described below */
 #define VERB_BLOCK_LVL	(32) /* squawk during block processing */
 #define VERB_DEBUG_U32	(64) /* squawk about what getu32() does */
 
-char **gargv;
-int goptind, gargc;
-
 #define	LABEL_SIZE	80
-char label[32768 + LABEL_SIZE];
 
-static int blocksize;
+struct buff_ctl;
+
+struct buff_ctl;
+
+struct vmb_ctx
+{
+	struct file_details file;
+	char *tapefile;
+	time_t secs_adj;
+	int fd;				/* tape file descriptor */
+	int cDelim, dflag, eflag, iflag, Iflag, lcflag, nflag, binaryFlag, tflag, vflag, wflag, xflag, Rflag, vfcflag;
+	int setnr, selset, skipSet, numHdrs, saveSet_errors, total_errors;
+	char selsetname[14];
+	int skipping;
+	char label[32768 + LABEL_SIZE];
+	int blocksize;
+	int buffalloc;
+	int num_buffers;
+	int buff_cnt;
+	struct buff_ctl *buffers;
+	int freebuffs;
+	int busybuffs;
+	int num_busys;
+	char **gargv;
+	int goptind;
+	int gargc;
+};
+
+static struct vmb_ctx g_ctx;
+static struct vmb_ctx *current_ctx = &g_ctx;
+
+static void vmb_ctx_reset(struct vmb_ctx *ctx)
+{
+	memset(ctx, 0, sizeof(*ctx));
+}
+
+static struct vmb_ctx *ctx_from_file(struct file_details *f)
+{
+	/* file_details is the first field of vmb_ctx; derive the owner */
+	char *base = (char *)f;
+	return (struct vmb_ctx *)(base - offsetof(struct vmb_ctx, file));
+}
 
 /*
  * Someday, one might want to make MAX_BUFFCOUNT dynamic and get the actual
@@ -430,14 +458,6 @@ struct buff_ctl
 	unsigned long blknum;	/*!< block number (stored here for ease of use) */
 };
 
-static int buffalloc;		/*!< size of each buffer within buff_ctl */
-static int num_buffers;		/*!< number of buffers currently allocated */
-static int buff_cnt;		/*!< buffer count spec'd with /BUFF to VMS BACKUP (from saveset) */
-static struct buff_ctl *buffers; /*!< pointer to array of buffers (0th entry is unused) */
-static int freebuffs;		/*!< index to first item in freelist  */
-static int busybuffs;		/*!< index to first item in busy list */
-static int num_busys;		/*!< number of items currently on busy queue */
-
 /* Byte-swapping routines.  Note that these do not depend on the size
    of datatypes such as short, long, etc., nor do they require us to
    detect the endianness of the machine we are running on.  It is
@@ -446,29 +466,67 @@ static int num_busys;		/*!< number of items currently on busy queue */
    add them if needed.  They are, of course little-endian as that is
    the byteorder used by all integers in a BACKUP saveset.  */
 
-static unsigned long getu32 ( unsigned char *addr )
+static unsigned long getu32 ( struct vmb_ctx *ctx, unsigned char *addr )
 {
 	unsigned long ans;
 	ans = addr[3];
 	ans = (ans<<8) | addr[2];
 	ans = (ans<<8) | addr[1];
 	ans = (ans<<8) | addr[0];
-	if ( (vflag&VERB_DEBUG_U32) )
+	if ( (ctx->vflag&VERB_DEBUG_U32) )
 		printf("getu32(): %p=%02X %02X %02X %02x = 0x%lX (%ld)\n", (void *)addr, addr[0], addr[1], addr[2], addr[3], ans, ans);
 	return ans;
 }
 
-static unsigned int getu16 ( unsigned char *addr )
+static unsigned int getu16 ( struct vmb_ctx *ctx, unsigned char *addr )
 {
 	unsigned int ans;
 	ans = (addr[1] << 8) | addr[0];
-	if ( (vflag&VERB_DEBUG_U32) )
+	if ( (ctx->vflag&VERB_DEBUG_U32) )
 		printf("getu16(): %p=%02X %02X = 0x%X (%d)\n", (void *)addr, addr[0], addr[1], ans, ans);
 	return ans;
 }
 
-#define GETU16(x) getu16( (unsigned char *)&(x) )
-#define GETU32(x) getu32( (unsigned char *)&(x) )
+#define GETU16(ctx,x) getu16( ctx, (unsigned char *)&(x) )
+
+#define file (current_ctx->file)
+#define tapefile (current_ctx->tapefile)
+#define secs_adj (current_ctx->secs_adj)
+#define fd (current_ctx->fd)
+#define cDelim (current_ctx->cDelim)
+#define dflag (current_ctx->dflag)
+#define eflag (current_ctx->eflag)
+#define iflag (current_ctx->iflag)
+#define Iflag (current_ctx->Iflag)
+#define lcflag (current_ctx->lcflag)
+#define nflag (current_ctx->nflag)
+#define binaryFlag (current_ctx->binaryFlag)
+#define tflag (current_ctx->tflag)
+#define vflag (current_ctx->vflag)
+#define wflag (current_ctx->wflag)
+#define xflag (current_ctx->xflag)
+#define Rflag (current_ctx->Rflag)
+#define vfcflag (current_ctx->vfcflag)
+#define setnr (current_ctx->setnr)
+#define selset (current_ctx->selset)
+#define skipSet (current_ctx->skipSet)
+#define numHdrs (current_ctx->numHdrs)
+#define saveSet_errors (current_ctx->saveSet_errors)
+#define total_errors (current_ctx->total_errors)
+#define selsetname (current_ctx->selsetname)
+#define skipping (current_ctx->skipping)
+#define label (current_ctx->label)
+#define blocksize (current_ctx->blocksize)
+#define buffers (current_ctx->buffers)
+#define buffalloc (current_ctx->buffalloc)
+#define num_buffers (current_ctx->num_buffers)
+#define buff_cnt (current_ctx->buff_cnt)
+#define freebuffs (current_ctx->freebuffs)
+#define busybuffs (current_ctx->busybuffs)
+#define num_busys (current_ctx->num_busys)
+#define gargv (current_ctx->gargv)
+#define goptind (current_ctx->goptind)
+#define gargc (current_ctx->gargc)
 
 /**
  * Dump the contents (indicies only) of the busy and free queues.
@@ -802,7 +860,7 @@ static void remove_dups( void )
 	}
 }
 
-static int getRfmRatt(struct file_details *file, char *rcdFormat, int dstLen, char delim)
+static int getRfmRatt(struct file_details *f, char *rcdFormat, int dstLen, char delim)
 {
 	int ii,rLen;
 	static struct
@@ -841,22 +899,22 @@ static int getRfmRatt(struct file_details *file, char *rcdFormat, int dstLen, ch
 	rLen = 0;
 	for (ii=0; ii < n_elts(RcdFmts);++ii)
 	{
-		if ( file->savRecFmt == RcdFmts[ii].type )
+		if ( f->savRecFmt == RcdFmts[ii].type )
 		{
-			if ( file->savRecFmt == FAB_dol_C_VFC )
-				rLen += snprintf(rcdFormat + rLen, dstLen - rLen, "%c%s%d%c%d", delim, RcdFmts[ii].name, file->vfcsize, delim, file->recsize);
+			if ( f->savRecFmt == FAB_dol_C_VFC )
+				rLen += snprintf(rcdFormat + rLen, dstLen - rLen, "%c%s%d%c%d", delim, RcdFmts[ii].name, f->vfcsize, delim, f->recsize);
 			else
-				rLen += snprintf(rcdFormat + rLen, dstLen - rLen, "%c%s%c%d", delim, RcdFmts[ii].name, delim, file->recsize);
+				rLen += snprintf(rcdFormat + rLen, dstLen - rLen, "%c%s%c%d", delim, RcdFmts[ii].name, delim, f->recsize);
 			break;
 		}
 	}
 	if ( ii >= n_elts(RcdFmts) )
-		rLen += snprintf(rcdFormat + rLen, dstLen - rLen, "%cUNDEF%c%d", delim, delim, file->recsize);
-	if ( (file->recatt&((1<<n_elts(RcdAtts))-1)) )
+		rLen += snprintf(rcdFormat + rLen, dstLen - rLen, "%cUNDEF%c%d", delim, delim, f->recsize);
+	if ( (f->recatt&((1<<n_elts(RcdAtts))-1)) )
 	{
 		for ( ii = 0; ii < n_elts(RcdAtts); ++ii )
 		{
-			if ( (file->recatt&RcdAtts[ii].mask) )
+			if ( (f->recatt&RcdAtts[ii].mask) )
 				rLen += snprintf(rcdFormat + rLen, dstLen - rLen, "%c%s", delim, RcdAtts[ii].name);
 		}
 	}
@@ -886,14 +944,14 @@ static int getRfmRatt(struct file_details *file, char *rcdFormat, int dstLen, ch
 static char lastFileName[256];
 static int lastVersionNumber;
 
-static FILE *openfile ( struct file_details *file )
+static FILE *openfile ( struct file_details *f )
 {
 	char ans[80];
 	char *p, *q, s, *ext = NULL; /*, *justFileName; */
 	int procf;
-	char *ufn = file->ufname;
-	char *fn = file->name;
-	int dirfile = file->directory;
+	char *ufn = f->ufname;
+	char *fn = f->name;
+	int dirfile = f->directory;
 	char rfm[MAX_FORMAT_LEN+4];
 
 	procf = 1;
@@ -936,16 +994,16 @@ static FILE *openfile ( struct file_details *file )
 	if ( !dflag )
 	{
 		strcpy( ufn, q );	/* not keeping the directory structure so toss the path */
-		file->altUPfName[0] = '.'; /* alternate file starts with a '.' */
-		strncpy(file->altUPfName+1, q, sizeof(file->altUPfName)-2);
+		f->altUPfName[0] = '.'; /* alternate file starts with a '.' */
+		strncpy(f->altUPfName+1, q, sizeof(f->altUPfName)-2);
 	}
 	else
 	{
 		int sLen = q-ufn;	/* Get length of path */
-		memcpy(file->altUPfName, ufn, sLen); /* duplicate the path */
-		file->altUPfName[sLen] = '.'; /* start alternate filename with a '.' */
-		file->altUfNameOnly = file->altUPfName+sLen;
-		strncpy(file->altUPfName + sLen + 1, q, sizeof(file->altUPfName)-sLen-2); /* copy rest of filename */
+		memcpy(f->altUPfName, ufn, sLen); /* duplicate the path */
+		f->altUPfName[sLen] = '.'; /* start alternate filename with a '.' */
+		f->altUfNameOnly = f->altUPfName+sLen;
+		strncpy(f->altUPfName + sLen + 1, q, sizeof(f->altUPfName)-sLen-2); /* copy rest of filename */
 	}
 	/* strip off the version number and possibly fix the filename's case */
 	while ( *q && *q != ';' )
@@ -954,32 +1012,32 @@ static FILE *openfile ( struct file_details *file )
 			ext = q;
 		q++;
 	}
-	file->do_binary = 0;
-	file->do_rat = 0;
+	f->do_binary = 0;
+	f->do_rat = 0;
 	if ( !binaryFlag )
 	{
 		const char *snarkMsg=NULL;
-		file->do_rat = (file->recatt & ((1 << FAB_dol_V_FTN) | (1 << FAB_dol_V_CR) | (1 << FAB_dol_V_PRN)));
-		if ( ((file->recfmt & 0x1F) == FAB_dol_C_FIX) || ((file->recfmt & 0x1F) == FAB_dol_C_FIX11) )
+		f->do_rat = (f->recatt & ((1 << FAB_dol_V_FTN) | (1 << FAB_dol_V_CR) | (1 << FAB_dol_V_PRN)));
+		if ( ((f->recfmt & 0x1F) == FAB_dol_C_FIX) || ((f->recfmt & 0x1F) == FAB_dol_C_FIX11) )
 			snarkMsg = "Snark: process_file(): File %s is FIXED. Setting it to binary\n";
-		if ( !snarkMsg && /* ((file->recfmt & 0x1F) == FAB_dol_C_VAR) && */ !file->do_rat )
+		if ( !snarkMsg && /* ((file->recfmt & 0x1F) == FAB_dol_C_VAR) && */ !f->do_rat )
 			snarkMsg = "Snark: process_file(): File %s has no record attibutes. Setting it to binary\n";
 		if ( snarkMsg )
 		{
-			printf(snarkMsg, file->ufname);
-			file->savRecFmt = file->recfmt;
-			file->recfmt = FAB_dol_C_RAW;
-			file->do_binary = 1;
+			printf(snarkMsg, f->ufname);
+			f->savRecFmt = f->recfmt;
+			f->recfmt = FAB_dol_C_RAW;
+			f->do_binary = 1;
 		}
 	}
 	else
 	{
-		file->recfmt = FAB_dol_C_RAW;
-		file->do_binary = 1;
+		f->recfmt = FAB_dol_C_RAW;
+		f->do_binary = 1;
 	}
 	if ( *q == ';' )
 	{
-		file->versionPtr = q;
+		f->versionPtr = q;
 		if ( Rflag )
 		{
 			char *endp = NULL;
@@ -1010,19 +1068,19 @@ static FILE *openfile ( struct file_details *file )
 		*q = '\0';
 	else if ( cDelim )
 		*q = cDelim;
-	getRfmRatt(file,rfm,sizeof(rfm),cDelim);
-	if ( file->do_binary )
+	getRfmRatt(f,rfm,sizeof(rfm),cDelim);
+	if ( f->do_binary )
 	{
-		strncat(ufn, rfm, sizeof(file->ufname)-1);
-		file->savRecFmt = file->recfmt;
-		file->recfmt = FAB_dol_C_RAW;
-		file->do_binary = 1;
-		file->altUPfName[0] = 0;
-		file->altUfNameOnly = NULL;
+		strncat(ufn, rfm, sizeof(f->ufname)-1);
+		f->savRecFmt = f->recfmt;
+		f->recfmt = FAB_dol_C_RAW;
+		f->do_binary = 1;
+		f->altUPfName[0] = 0;
+		f->altUfNameOnly = NULL;
 	}
 	else
 	{
-		strncat(file->altUPfName, rfm, sizeof(file->altUPfName) - 1);
+		strncat(f->altUPfName, rfm, sizeof(f->altUPfName) - 1);
 	}
 	if ( procf )
 	{
@@ -1056,16 +1114,16 @@ static FILE *openfile ( struct file_details *file )
 		fp = fopen(p,"wb");
 		if ( !fp )
 		{
-			printf("Snark: Failed to open '%s' for output: %s\n", file->ufname, strerror(errno));
+			printf("Snark: Failed to open '%s' for output: %s\n", f->ufname, strerror(errno));
 		}
-		else if ( !binaryFlag && file->altUPfName[0])
+		else if ( !binaryFlag && f->altUPfName[0])
 		{
-			file->altf = fopen(file->altUPfName,"wb");
-			if ( !file->altf )
+			f->altf = fopen(f->altUPfName,"wb");
+			if ( !f->altf )
 			{
 				fclose(fp);
-				unlink(file->ufname);
-				printf("Snark: Failed to open '%s' for output: %s\n", file->altUPfName, strerror(errno));
+				unlink(f->ufname);
+				printf("Snark: Failed to open '%s' for output: %s\n", f->altUPfName, strerror(errno));
 				fp = NULL;
 			}
 		}
@@ -1284,8 +1342,8 @@ static time_t vms2unixsecs( unsigned char *text )
 {
 	unsigned long long vmstime, vmsepoch;
 
-	vmstime = getu32(text+4);
-	vmstime = (vmstime<<32) | getu32( text );
+	vmstime = getu32(current_ctx, text+4);
+	vmstime = (vmstime<<32) | getu32(current_ctx, text);
 	if ( !vmstime )
 		return(time_t)0;   /* no time specified */
 	vmstime /= 10000000LL;	/* Compute vms time in seconds (10^7 ticks per second) */
@@ -1375,8 +1433,8 @@ void process_file ( unsigned char *buffer, int rsize )
 		int clen;
 
 		bsa = (struct bsa *)( buffer + cc );
-		dsize = GETU16( bsa->bsa_dol_w_size );
-		dtype = GETU16( bsa->bsa_dol_w_type );
+		dsize = GETU16( current_ctx, bsa->bsa_dol_w_size );
+		dtype = GETU16( current_ctx, bsa->bsa_dol_w_type );
 		data  = (unsigned char *)bsa->bsa_dol_t_text;
 
 		if ( dsize < 0 || dsize+cc+4 > rsize )
@@ -1412,8 +1470,8 @@ void process_file ( unsigned char *buffer, int rsize )
 		case FREC_UID:
 			if ( dsize >= 4 )
 			{
-				file.usr = getu16(data);
-				file.grp = getu16(data + 2);
+				file.usr = getu16(current_ctx, data);
+				file.grp = getu16(current_ctx, data + 2);
 			}
 			if ( (vflag & VERB_FILE_RDLVL) )
 				printf( "File record field %2d, type UID, size %d. usr %06o, grp %06o\n",
@@ -1423,17 +1481,17 @@ void process_file ( unsigned char *buffer, int rsize )
 			file.recfmt = data[0];
 			file.savRecFmt = file.recfmt;
 			file.recatt = data[1];
-			file.recsize = getu16( data+2 );
+				file.recsize = getu16( current_ctx, data+2 );
 			/* bytes 4-7 unaccounted for.  */
-			file.nblk = getu16( data+10 )
+				file.nblk = getu16( current_ctx, data+10 )
 						/* Adding in the following amount is a
 						   change that I brought over from
 						   vmsbackup 3.1.  The comment there
 						   said "subject to confirmation from
 						   backup expert here" but I'll put it
 						   in until someone complains.  */
-						+ (64 * 1024) * getu16( data+8 );
-			file.lnch = getu16( data+12 );
+								 + (64 * 1024) * getu16( current_ctx, data+8 );
+				file.lnch = getu16( current_ctx, data+12 );
 			if ( !file.nblk )
 				file.size = 0;
 			else
@@ -1646,8 +1704,8 @@ void process_summary ( unsigned char *buffer, unsigned short rsize )
 			char tbuff[256];
 
 			bsa = ( struct bsa *)(buffer+cc);
-			dsize = GETU16( bsa->bsa_dol_w_size );
-			dtype = GETU16( bsa->bsa_dol_w_type );
+			dsize = GETU16( current_ctx, bsa->bsa_dol_w_size );
+			dtype = GETU16( current_ctx, bsa->bsa_dol_w_type );
 			text = (unsigned char *)bsa->bsa_dol_t_text;
 			cc += dsize+4;
 			++subf;
@@ -1736,7 +1794,7 @@ void process_summary ( unsigned char *buffer, unsigned short rsize )
 				if ( dsize == 4 )
 				{
 					unsigned long id;
-					id = GETU32( text );
+					id = getu32(current_ctx, text);
 					printf( "%02d: CPUPID:       0x%08lX\n", subf, id );
 				}
 				continue;
@@ -1760,7 +1818,7 @@ void process_summary ( unsigned char *buffer, unsigned short rsize )
 				if ( dsize == 4 )
 				{
 					unsigned long blk;
-					blk = getu32( text );
+					blk = getu32(current_ctx, text);
 					printf( "%02d: Blocksize:    %ld\n", subf, blk );
 				}
 				continue;
@@ -1768,14 +1826,14 @@ void process_summary ( unsigned char *buffer, unsigned short rsize )
 				if ( dsize == 2 )
 				{
 					int grp;
-					grp = getu16( text );
+					grp = getu16(current_ctx, text);
 					printf( "%02d: Groupsize:    %d\n", subf, grp );
 				}
 				continue;
 			case SUMM_BUFFCOUNT:
 				if ( dsize == 2 )
 				{
-					buff_cnt = getu16( text );
+					buff_cnt = getu16(current_ctx, text);
 					printf( "%02d: Buffcnt:      %d\n", subf, buff_cnt );
 				}
 				continue;
@@ -1960,7 +2018,7 @@ void process_vbn ( unsigned char *buffer, unsigned short rsize )
 					}
 					file.altboundIndex += 2;
 				}
-				file.reclen = getu16( (unsigned char *)buffer + buffIndex );
+				file.reclen = getu16( current_ctx, (unsigned char *)buffer + buffIndex );
 				buffIndex += 2;
 				file.inboundIndex += 2;		/* This has to match all bytes found in file */
 				file.file_state = ((file.recfmt&0x1F) == FAB_dol_C_VFC && file.vfcsize == 2) ? GET_VFC:GET_DATA;
@@ -2366,8 +2424,8 @@ static unsigned long get_block_number( unsigned char *bptr )
 
 	block_header = ( struct bbh * )bptr;
 
-	bhsize = GETU16( block_header->bbh_dol_w_size );
-	bsize = GETU32( block_header->bbh_dol_l_blocksize );
+	bhsize = GETU16( current_ctx, block_header->bbh_dol_w_size );
+	bsize = getu32(current_ctx, (unsigned char *)&block_header->bbh_dol_l_blocksize );
 
 	/* check the validity of the header block */
 	if ( bhsize != sizeof ( struct bbh ) )
@@ -2383,7 +2441,7 @@ static unsigned long get_block_number( unsigned char *bptr )
 #if 0
 /* TODO: Figure out how to compute the block checksum/crc and validate it here. */
 #endif
-	return GETU32( block_header->bbh_dol_l_number );
+return getu32(current_ctx, (unsigned char *)&block_header->bbh_dol_l_number );
 }
 
 /**
@@ -2412,8 +2470,8 @@ void process_block ( unsigned char *blkptr )
 	block_header = ( struct bbh * )blkptr;
 	ii = sizeof( struct bbh );
 
-/*    bhsize = GETU16( block_header->bbh_dol_w_size ); */
-	bsize = GETU32( block_header->bbh_dol_l_blocksize );
+/*    bhsize = GETU16( current_ctx, block_header->bbh_dol_w_size ); */
+	bsize = getu32(current_ctx, (unsigned char *)&block_header->bbh_dol_l_blocksize );
 
 	numb = get_block_number( blkptr );
 	if ( !numb )
@@ -2432,13 +2490,13 @@ void process_block ( unsigned char *blkptr )
 					numb, last_block_number+1 );
 	}
 	last_block_number = numb;
-	applic = GETU16( block_header->bbh_dol_w_applic );
+	applic = GETU16( current_ctx, block_header->bbh_dol_w_applic );
 	if ( (vflag & VERB_DEBUG_LVL) )
 	{
 		printf ( "new block: ii = %ld, bsize = %ld, opsys=%d, subsys=%d, applic=%d, number=%ld\n",
 				 ii, bsize,
-				 GETU16( block_header->bbh_dol_w_opsys ),
-				 GETU16( block_header->bbh_dol_w_subsys ),
+				 GETU16( current_ctx, block_header->bbh_dol_w_opsys ),
+				 GETU16( current_ctx, block_header->bbh_dol_w_subsys ),
 				 applic,
 				 numb );
 	}
@@ -2463,14 +2521,14 @@ void process_block ( unsigned char *blkptr )
 		record_header = ( struct brh * ) (blkptr+ii);
 		ii += sizeof ( struct brh );
 
-		rtype = GETU16( record_header->brh_dol_w_rtype );
-		rsize = GETU16( record_header->brh_dol_w_rsize );
+		rtype = GETU16( current_ctx, record_header->brh_dol_w_rtype );
+		rsize = GETU16( current_ctx, record_header->brh_dol_w_rsize );
 		if ( (vflag & VERB_DEBUG_LVL) )
 		{
 			printf ( "ii=%ld, rtype=%d, rsize=%d, flags=0x%lX, addr=0x%lX\n",
 					 ii, rtype, rsize,
-					 GETU32( record_header->brh_dol_l_flags ),
-					 GETU32( record_header->brh_dol_l_address ) );
+					 getu32(current_ctx, (unsigned char *)&record_header->brh_dol_l_flags ),
+					 getu32(current_ctx, (unsigned char *)&record_header->brh_dol_l_address ) );
 		}
 		if ( rsize+ii > bsize )	/* This is an invalid record */
 		{
@@ -2594,7 +2652,7 @@ static int read_record( unsigned char *buff, int len )
 			printf( "read_record: returns %d due to error or EOF.\n", sts );
 		return sts;
 	}
-	reclen = getu32( freclen );			/* convert endianess as appropriate */
+	reclen = getu32( current_ctx, freclen );			/* convert endianess as appropriate */
 	if ( !reclen )				/* A 0 length record is a fake tape mark */
 	{
 		tape_marks |= 1;			/* Reached a fake tape mark */
@@ -2652,7 +2710,7 @@ static int read_record( unsigned char *buff, int len )
 				printf( "read_record: returns %d due to error reading SIMH record length.\n", sts );
 			return sts;
 		}
-		Ireclen = getu32( iFreclen );			/* convert endianess as appropriate */
+		Ireclen = getu32( current_ctx, iFreclen );			/* convert endianess as appropriate */
 		if ( Ireclen != reclen )				/* it better match the starting one */
 		{
 			printf( "Snark: read_record: SIMH format record count mismatch. Expected %d read %d\n",  reclen, Ireclen);
@@ -3203,7 +3261,7 @@ void usage ( const char *progname, int full )
  *	@arg non-zero Reason for failure.
  */
 
-int vmsbackup_main ( int argc, char *argv[] )
+static int vmsbackup_entry(struct vmb_ctx *ctx, int argc, char *argv[])
 {
 	const char *progname;
 	int c, eoffl;
@@ -3213,6 +3271,9 @@ int vmsbackup_main ( int argc, char *argv[] )
 	struct tm tadj;
 	int option_index = 0;
 	struct stat fileStat;
+
+	current_ctx = ctx;
+	vmb_ctx_reset(current_ctx);
 	
 	memset( &tadj, 0, sizeof(tadj) );
 	tadj.tm_sec = 0;
@@ -3477,6 +3538,36 @@ int vmsbackup_main ( int argc, char *argv[] )
 
 	/* exit cleanly */
 	return 0;
+}
+
+int vmsbackup_main ( int argc, char *argv[] )
+{
+	return vmb_ctx_run(&g_ctx, argc, argv);
+}
+
+vmb_ctx *vmb_ctx_create(void)
+{
+	vmb_ctx *ctx = (vmb_ctx *)malloc(sizeof(vmb_ctx));
+	if (ctx)
+	{
+		vmb_ctx_reset(ctx);
+	}
+	return ctx;
+}
+
+void vmb_ctx_destroy(vmb_ctx *ctx)
+{
+	if (ctx)
+	{
+		free(ctx);
+	}
+}
+
+int vmb_ctx_run(vmb_ctx *ctx, int argc, char *argv[])
+{
+	if (!ctx)
+		return -1;
+	return vmsbackup_entry(ctx, argc, argv);
 }
 
 #ifndef VMSBACKUP_NO_MAIN

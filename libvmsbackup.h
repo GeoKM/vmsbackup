@@ -16,6 +16,12 @@ extern "C" {
 #endif
 
 int vmsbackup_main(int argc, char *argv[]);
+struct vmb_ctx;
+typedef struct vmb_ctx vmb_ctx;
+
+vmb_ctx *vmb_ctx_create(void);
+void vmb_ctx_destroy(vmb_ctx *ctx);
+int vmb_ctx_run(vmb_ctx *ctx, int argc, char *argv[]);
 
 #ifdef __cplusplus
 }
