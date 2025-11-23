@@ -182,6 +182,8 @@
 #endif
 #include	<sys/file.h>
 
+#include	"libvmsbackup.h"
+
 #if MSYS2 || MINGW
 #define MKDIR(a,b) mkdir(a)
 #define OPEN_FLAGS O_RDONLY|O_BINARY
@@ -3201,7 +3203,7 @@ void usage ( const char *progname, int full )
  *	@arg non-zero Reason for failure.
  */
 
-int main ( int argc, char *argv[] )
+int vmsbackup_main ( int argc, char *argv[] )
 {
 	const char *progname;
 	int c, eoffl;
@@ -3476,3 +3478,10 @@ int main ( int argc, char *argv[] )
 	/* exit cleanly */
 	return 0;
 }
+
+#ifndef VMSBACKUP_NO_MAIN
+int main ( int argc, char *argv[] )
+{
+	return vmsbackup_main(argc, argv);
+}
+#endif

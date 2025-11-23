@@ -320,4 +320,7 @@ As with VAR, the xx is a filler byte.
 Where vfc0 (0x01) indicates the leading character is "normal" and to output a newline (0x0A) and
 vfc1 (0x8D) indicates to output a 0x0D (carrage return) at the end of the record.
 
+## Embedding and GUI groundwork
+- Build a static library with `make -f Makefile.common libvmsbackup.a` to link the core into other tools.
+- The callable entry point is `vmsbackup_main(int argc, char **argv)` declared in `libvmsbackup.h`. It currently shares process-global state and may call `exit()` on fatal errors; further refactoring is planned to provide a fully re-entrant, callback-driven API for GUI use.
 
