@@ -169,9 +169,7 @@
 #include	<getopt.h>
 #include	<time.h>
 #include	<utime.h>
-#if HAVE_STRERROR
 #include	<errno.h>
-#endif
 #include	<sys/types.h>
 #ifdef REMOTE
 	#include	<local/rmt.h>
@@ -196,8 +194,6 @@
 #ifndef n_elts
 #define n_elts(x) (int)(sizeof(x)/sizeof((x)[0]))
 #endif
-
-#define INT_SIZEOF(x) (int)(sizeof(x))
 
 extern int match ( const char *string, const char *pattern );
 static int typecmp ( const char *str, int which );
@@ -232,8 +228,6 @@ struct bbh
 	char bbh_dol_t_spare_2[22];
 	short bbh_dol_w_checksum;
 };
-
-static unsigned long last_block_number;
 
 struct brh
 {
@@ -313,7 +307,7 @@ struct file_details
 	int file_size_error;
 	int file_format_error;
 	FileState_t file_state;
-} file;
+};
 
 #define	FAB_dol_C_RAW	0	/* undefined */
 #define	FAB_dol_C_FIX	1	/* fixed-length record */
@@ -426,12 +420,6 @@ struct vmb_ctx
 };
 
 static struct vmb_ctx g_ctx;
-static struct vmb_ctx *current_ctx = &g_ctx;
-
-static void vmb_ctx_reset(struct vmb_ctx *ctx)
-{
-	memset(ctx, 0, sizeof(*ctx));
-}
 
 /*
  * Someday, one might want to make MAX_BUFFCOUNT dynamic and get the actual
@@ -482,368 +470,6 @@ static unsigned int getu16 ( struct vmb_ctx *ctx, unsigned char *addr )
 }
 
 #define GETU16(ctx,x) getu16( ctx, (unsigned char *)&(x) )
-
-
-/**
- * Dump the contents (indicies only) of the busy and free queues.
- *
- * @param which Bitmask of which queue to dump.
- * 	@arg 1 Dump the busy queue
- * 	@arg 2 Dump the free queue
- *
- * @return nothing
- */
-
-static void dump_queues( struct vmb_ctx *ctx, int which )
-{
-	if ( (ctx->vflag&VERB_QUEUE_LVL) )
-	{
-		int idx;
-		struct buff_ctl *bptr;
-		if ( (which&1) )
-		{
-			printf( " Busy queue (%d): ", ctx->busybuffs );
-			idx = ctx->busybuffs;
-			while ( idx )
-			{
-				printf( "%d ", idx );
-				bptr = ctx->buffers + idx;
-				idx = bptr->next;
-			}
-			printf( "\n" );
-		}
-		if ( (which&2) )
-		{
-			printf( " Free queue (%d): ", ctx->freebuffs );
-			idx = ctx->freebuffs;
-			while ( idx )
-			{
-				printf( "%d ", idx );
-				bptr = ctx->buffers + idx;
-				idx = bptr->next;
-			}
-			printf( "\n" );
-		}
-	}
-}
-
-/**
- * Pop top item off busy queue
- *
- * @return Pointer to item or 0 if nothing available.
- */
-
-static struct buff_ctl *popbusy_buff(struct vmb_ctx *ctx)
-{
-	struct buff_ctl *bptr;
-	if ( !ctx->busybuffs )
-	{
-		if ( (ctx->vflag&VERB_QUEUE_LVL) )
-		{
-			printf( "popbusy_buff(): No items on queue.\n" );
-			dump_queues(ctx, 3 );
-		}
-		return NULL;
-	}
-	bptr = ctx->buffers + ctx->busybuffs;
-	ctx->busybuffs = bptr->next;
-	bptr->next = 0;
-	--ctx->num_busys;
-	if ( (ctx->vflag&VERB_QUEUE_LVL) )
-	{
-		printf( "popbusy_buff(): popped %ld off busy queue. num_busys now %d\n",
-				(long)(bptr-ctx->buffers), ctx->num_busys );
-		dump_queues(ctx, 3 );
-	}
-	return bptr;
-}
-
-/**
- * Add item to busy queue.
- *
- * @param bptr Pointer to item.
- * @param front Flag indicating where to add.
- *	@arg 0 Append to end of list.
- *	@arg 1 Prepend to front of list.
- *
- * @return nothing
- */
-
-static void add_busybuff( struct vmb_ctx *ctx, struct buff_ctl *bptr, int front ) 
-{
-	int prev, ii;
-
-	++ctx->num_busys;
-	if ( (ctx->vflag&VERB_QUEUE_LVL) )
-	{
-		printf( "add_busybuff(): Added item %ld to %s of busy queue. num_busys now %d\n",
-				(long)(bptr - ctx->buffers), front ? "head" : "tail", ctx->num_busys );
-	}
-	if ( front )
-	{
-		bptr->next = ctx->busybuffs;
-		ctx->busybuffs = bptr-ctx->buffers;
-	}
-	else
-	{
-		prev = 0;
-		ii = ctx->busybuffs;
-		bptr->next = 0;		/* make sure this is off */
-		while ( ii )		/* walk the chain */
-		{
-			prev = ii;		/* remember this */
-			ii = ctx->buffers[ii].next;	/* advance to next */
-		}
-		if ( prev )			/* if there was a chain */
-			ctx->buffers[prev].next = bptr-ctx->buffers; /* link it */
-		else
-			ctx->busybuffs = bptr-ctx->buffers; /* else we are on top */
-	}
-	dump_queues(ctx, 3 );
-}
-
-/**
- * Get an item from free queue.
- *
- * @return Pointer to item or NULL if free queue empty.
- */
-
-static struct buff_ctl *getfree_buff(struct vmb_ctx *ctx)
-{
-	struct buff_ctl *bptr;
-	if ( !ctx->freebuffs )
-	{
-		if ( (ctx->vflag&VERB_QUEUE_LVL) )
-		{
-			printf( "getfree_buff(): Nothing on free list!!! num_busys now %d\n", ctx->num_busys );
-			dump_queues(ctx, 3 );
-		}
-		return NULL;
-	}
-	bptr = ctx->buffers + ctx->freebuffs;
-	ctx->freebuffs = bptr->next;
-	bptr->next = 0;
-	bptr->amt = 0;
-	bptr->blknum = 0;
-	if ( (ctx->vflag&VERB_QUEUE_LVL) )
-	{
-		printf( "getfree_buff(): Extracted %ld from freelist. num_busys now %d\n",
-				(long)(bptr-ctx->buffers), ctx->num_busys );
-		dump_queues(ctx, 3 );
-	}
-	return bptr;
-}
-
-/**
- * Put item back on free queue.
- *
- * @param bptr Pointer to item.
- *
- * @return nothing.
- */
-
-static void free_buff( struct vmb_ctx *ctx, struct buff_ctl *bptr )
-{
-	if ( bptr )
-	{
-		bptr->next = ctx->freebuffs;
-		ctx->freebuffs = bptr - ctx->buffers;
-		if ( (ctx->vflag&VERB_QUEUE_LVL) )
-		{
-			printf( "free_buff(): Put %ld on freelist. num_busys now %d\n", (long)(bptr - ctx->buffers), ctx->num_busys );
-			dump_queues(ctx, 3 );
-		}
-	}
-}
-
-/** 
- * Put all buffers back on free queue.
- *
- * @return nothing.
- */
-
-static void freeall( struct vmb_ctx *ctx )
-{
-	if ( ctx->buffers )
-	{
-		struct buff_ctl *bp;
-		int ii;
-		bp = ctx->buffers+1;
-		for ( ii=1; ii < ctx->num_buffers-1; ++ii, ++bp )
-			bp->next = ii+1;
-		bp->next = 0;
-		ctx->freebuffs = 1;
-		ctx->busybuffs = 0;
-		if ( (ctx->vflag&VERB_QUEUE_LVL) )
-		{
-			printf( "freeall(): Free'd all buffers.\n" );
-			dump_queues(ctx, 3 );
-		}
-	}
-}
-
-/**
- * Remove duplicate blocks from busy list.
- *
- * @return nothing.
- */
-
-static void remove_dups( struct vmb_ctx *ctx )
-{
-	int ii, lim, jj;
-	struct buff_ctl *bptr, *la;
-	int buffs[MAX_BUFFCOUNT];		/* place to hold clone of buffer layout */
-
-	if ( ctx->num_busys <= 1 )
-		return;				/* nothing to do if there's only one item */
-	memset( buffs, 0, sizeof(buffs) );	/* preclear local array */
-	buffs[0] = ctx->busybuffs;
-	bptr = ctx->buffers + ctx->busybuffs;
-	lim = 1;
-	while ( lim < MAX_BUFFCOUNT && bptr->next )	/* clone the busy list to our local array */
-	{
-		buffs[lim++] = bptr->next;
-		la = ctx->buffers + bptr->next;
-		bptr = la;
-	}
-	if ( lim >= MAX_BUFFCOUNT && bptr->next )
-	{
-		printf( "Snark: fatal internal error. Too many items on buffer list.\n" );
-		ctx->skipping |= SKIP_TO_SAVESET;/* toss the remainder of this saveset */
-		return;
-	}
-	if ( lim != ctx->num_busys )
-	{
-		printf( "Snark: fatal internal error. busy list count (%d) != num_busys (%d).\n",
-				lim, ctx->num_busys );
-		ctx->skipping |= SKIP_TO_SAVESET;/* toss the remainder of this saveset */
-		return;
-	}
-	if ( lim == 2 && !bptr->amt )	/* only two items, but second is a tm */
-		return;/* so, nothing to do */
-/* First, check each entry for a duplicate entry */
-	if ( (ctx->vflag&VERB_QUEUE_LVL) )
-	{
-		printf( "Before checking for duplicates:\n Busy queue (?): " );
-		for ( ii=0; ii < lim; ++ii )
-			printf( "%d ", buffs[ii] );
-		printf( "\n blknums: " );
-		for ( ii=0; ii < lim; ++ii )
-		{
-			bptr = ctx->buffers + buffs[ii];
-			printf( "%7ld ", bptr->blknum );
-		}
-		printf( "\n" );
-		dump_queues(ctx, 2 );
-	}
-/*
- * If there are duplicate blocks, the later one must win.
- */
-	for ( ii=0; ii < lim-1; ++ii )	 /* for each item in busy list */
-	{
-		bptr = ctx->buffers + buffs[ii];
-		for ( jj=ii+1; jj < lim; ++jj )	 /* check to see if there's a like numbered one that came later */
-		{
-			la = ctx->buffers + buffs[jj];
-			if ( la->amt && la->blknum == bptr->blknum )
-			{
-				if ( (ctx->vflag&VERB_FILE_RDLVL) )
-					printf( "Found duplicate block numbered %ld. Discarded original.\n", bptr->blknum );
-				buffs[ii] = buffs[jj];	/* Just place the duplicate in the original's location */
-				if ( lim-jj > 1 )	/* and shift what's left (if any) up one spot */
-					memmove( buffs+jj, buffs+jj+1, (lim-jj-1) * sizeof(int) );
-				--ii;			/* conteract the outer for loop's ++ */
-				--lim;			/* shrink the total by 1 */
-				--ctx->num_busys;		/* reduce busy count too */
-				if ( (ctx->vflag&VERB_QUEUE_LVL) )
-				{
-					printf( "Found duplicate block numbered %ld. Discarding buffer %ld\n",
-						bptr->blknum, (long)(bptr-ctx->buffers) );
-					ctx->busybuffs = buffs[0]; /* fixup the busy que so it'll display correctly */
-					for ( jj=0; jj < lim-1; ++jj )
-					{
-						la = ctx->buffers + buffs[jj];
-						la->next = buffs[jj+1];
-					}
-					la = ctx->buffers + buffs[jj];
-					la->next = 0;
-				}
-				free_buff( ctx, bptr );	/* toss the original buffer */
-				break;		/* look again from the beginning */
-			}
-		}
-	}
-	if ( (ctx->vflag&VERB_QUEUE_LVL) )
-	{
-		printf( "After checking for duplicates:\n Busy queue (%d): ", ctx->busybuffs );
-		for ( ii=0; ii < lim; ++ii )
-			printf( "%d ", buffs[ii] );
-		printf( "\n blknums: " );
-		for ( ii=0; ii < lim; ++ii )
-		{
-			bptr = ctx->buffers + buffs[ii];
-			printf( "%7ld ", bptr->blknum );
-		}
-		printf( "\n" );
-		dump_queues(ctx, 2 );
-	}
-	/* Now check the busy list for holes */
-	for ( ii=0; ii < lim-1; ++ii )
-	{
-		bptr = ctx->buffers + buffs[ii];
-		la = ctx->buffers + buffs[ii+1];
-		if ( la->blknum-bptr->blknum > 1 )
-		{
-			printf( "Snark: missing block(s) %ld..%ld [%d missing].\n",
-					bptr->blknum+1, la->blknum-1, (int)(la->blknum - bptr->blknum - 1) );
-			if ( !ctx->eflag && !ctx->xflag )
-			{
-				ctx->skipping |= SKIP_TO_FILE;
-				return;/* abort during listing */
-			}
-		}
-	}
-}
-
-#define file (current_ctx->file)
-#define tapefile (current_ctx->tapefile)
-#define secs_adj (current_ctx->secs_adj)
-#define fd (current_ctx->fd)
-#define cDelim (current_ctx->cDelim)
-#define dflag (current_ctx->dflag)
-#define eflag (current_ctx->eflag)
-#define iflag (current_ctx->iflag)
-#define Iflag (current_ctx->Iflag)
-#define lcflag (current_ctx->lcflag)
-#define nflag (current_ctx->nflag)
-#define binaryFlag (current_ctx->binaryFlag)
-#define tflag (current_ctx->tflag)
-#define vflag (current_ctx->vflag)
-#define wflag (current_ctx->wflag)
-#define xflag (current_ctx->xflag)
-#define Rflag (current_ctx->Rflag)
-#define vfcflag (current_ctx->vfcflag)
-#define setnr (current_ctx->setnr)
-#define selset (current_ctx->selset)
-#define skipSet (current_ctx->skipSet)
-#define numHdrs (current_ctx->numHdrs)
-#define saveSet_errors (current_ctx->saveSet_errors)
-#define total_errors (current_ctx->total_errors)
-#define selsetname (current_ctx->selsetname)
-#define skipping (current_ctx->skipping)
-#define label (current_ctx->label)
-#define blocksize (current_ctx->blocksize)
-#define buffers (current_ctx->buffers)
-#define buffalloc (current_ctx->buffalloc)
-#define num_buffers (current_ctx->num_buffers)
-#define buff_cnt (current_ctx->buff_cnt)
-#define freebuffs (current_ctx->freebuffs)
-#define busybuffs (current_ctx->busybuffs)
-#define num_busys (current_ctx->num_busys)
-#define gargv (current_ctx->gargv)
-#define goptind (current_ctx->goptind)
-#define gargc (current_ctx->gargc)
-
 
 
 static int getRfmRatt(struct file_details *f, char *rcdFormat, int dstLen, char delim)
@@ -930,7 +556,7 @@ static int getRfmRatt(struct file_details *f, char *rcdFormat, int dstLen, char 
 static char lastFileName[256];
 static int lastVersionNumber;
 
-static FILE *openfile ( struct file_details *f )
+static FILE *openfile ( struct vmb_ctx *ctx, struct file_details *f )
 {
 	char ans[80];
 	char *p, *q, s, *ext = NULL; /*, *justFileName; */
@@ -948,7 +574,7 @@ static FILE *openfile ( struct file_details *f )
 		++p;
 	while ( *p )
 	{
-		if ( lcflag && isupper ( *p ) )
+		if ( ctx->lcflag && isupper ( *p ) )
 			*q = tolower( *p );
 		else
 			*q = *p;
@@ -966,7 +592,7 @@ static FILE *openfile ( struct file_details *f )
 		{
 			s = *q;
 			*q = '\0';
-			if ( procf && dflag )
+			if ( procf && ctx->dflag )
 				MKDIR( p, 0777 );
 			*q = '/';
 			if ( s == ']' )
@@ -977,7 +603,7 @@ static FILE *openfile ( struct file_details *f )
 	++q;	/* both ufn and p point to path and q points to start of filename in the ufn string. */
 	/* Make a copy of the directory */
 /*	justFileName = q; */
-	if ( !dflag )
+	if ( !ctx->dflag )
 	{
 		strcpy( ufn, q );	/* not keeping the directory structure so toss the path */
 		f->altUPfName[0] = '.'; /* alternate file starts with a '.' */
@@ -1000,7 +626,7 @@ static FILE *openfile ( struct file_details *f )
 	}
 	f->do_binary = 0;
 	f->do_rat = 0;
-	if ( !binaryFlag )
+	if ( !ctx->binaryFlag )
 	{
 		const char *snarkMsg=NULL;
 		f->do_rat = (f->recatt & ((1 << FAB_dol_V_FTN) | (1 << FAB_dol_V_CR) | (1 << FAB_dol_V_PRN)));
@@ -1024,7 +650,7 @@ static FILE *openfile ( struct file_details *f )
 	if ( *q == ';' )
 	{
 		f->versionPtr = q;
-		if ( Rflag )
+		if ( ctx->Rflag )
 		{
 			char *endp = NULL;
 			int curVersion;
@@ -1050,11 +676,11 @@ static FILE *openfile ( struct file_details *f )
 			*q = ';';
 		}
 	}
-	if ( Rflag )
+	if ( ctx->Rflag )
 		*q = '\0';
-	else if ( cDelim )
-		*q = cDelim;
-	getRfmRatt(f,rfm,sizeof(rfm),cDelim);
+	else if ( ctx->cDelim )
+		*q = ctx->cDelim;
+	getRfmRatt(f,rfm,sizeof(rfm),ctx->cDelim);
 	if ( f->do_binary )
 	{
 		strncat(ufn, rfm, sizeof(f->ufname)-1);
@@ -1068,7 +694,55 @@ static FILE *openfile ( struct file_details *f )
 	{
 		strncat(f->altUPfName, rfm, sizeof(f->altUPfName) - 1);
 	}
-
+	if ( procf )
+	{
+		if ( dirfile )
+		{
+			procf = 0;			/* never explicitly extract directory files */
+			if ( (ctx->vflag & VERB_DEBUG_LVL) )
+			{
+				printf( "Skipping explicit extraction of \"%s\" because it's a directory.\n", p );
+			}
+		}
+		else
+		{
+			if ( ext && procf )
+			{
+				procf = typecmp(++ext, ctx->eflag);
+			}
+		}
+	}
+	if ( procf && ctx->wflag )
+	{
+		printf ( "extract %s [ny]", p );
+		fflush ( stdout );
+		fgets ( ans, sizeof ( ans ), stdin );
+		if ( *ans != 'y' )
+			procf = 0;
+	}
+	if ( procf )
+	{
+		FILE *fp;
+		fp = fopen(p,"wb");
+		if ( !fp )
+		{
+			printf("Snark: Failed to open '%s' for output: %s\n", f->ufname, strerror(errno));
+		}
+		else if ( !ctx->binaryFlag && f->altUPfName[0])
+		{
+			f->altf = fopen(f->altUPfName,"wb");
+			if ( !f->altf )
+			{
+				fclose(fp);
+				unlink(f->ufname);
+				printf("Snark: Failed to open '%s' for output: %s\n", f->altUPfName, strerror(errno));
+				fp = NULL;
+			}
+		}
+		return fp;
+	}
+	else
+		return( NULL );
 }
 
 /**
@@ -1084,9 +758,6 @@ static FILE *openfile ( struct file_details *f )
  * Compares the filename type in pointed to by str
  * with our list of file types to be ignored.
  */
-#ifndef n_elts
-#define n_elts(x) (int)(sizeof(x)/sizeof((x)[0]))
-#endif
 
 int typecmp ( const char *str, int which )
 {
@@ -1155,13 +826,6 @@ int typecmp ( const char *str, int which )
  * Closes the file opened previously with openfile. Reports any straggling
  * errors if they can be detected at this point.
  */
-
-#undef file
-#undef xflag
-#undef vflag
-#undef skipping
-#undef binaryFlag
-#undef cDelim
 
 static void close_file_ctx( struct vmb_ctx *ctx )
 {
@@ -1252,27 +916,15 @@ static void close_file_ctx( struct vmb_ctx *ctx )
 	}
 }
 
-#define file (current_ctx->file)
-#define xflag (current_ctx->xflag)
-#define vflag (current_ctx->vflag)
-#define skipping (current_ctx->skipping)
-#define binaryFlag (current_ctx->binaryFlag)
-#define cDelim (current_ctx->cDelim)
-
-static void close_file(void)
-{
-	close_file_ctx(current_ctx);
-}
-
-static time_t vms2unixsecs( unsigned char *text );
+static time_t vms2unixsecs( struct vmb_ctx *ctx, unsigned char *text );
 static const char *vms2unixtime( time_t unixtime );
 
-static time_t vms2unixsecs( unsigned char *text )
+static time_t vms2unixsecs( struct vmb_ctx *ctx, unsigned char *text )
 {
 	unsigned long long vmstime, vmsepoch;
 
-	vmstime = getu32(current_ctx, text+4);
-	vmstime = (vmstime<<32) | getu32(current_ctx, text);
+	vmstime = getu32(ctx, text+4);
+	vmstime = (vmstime<<32) | getu32(ctx, text);
 	if ( !vmstime )
 		return(time_t)0;   /* no time specified */
 	vmstime /= 10000000LL;	/* Compute vms time in seconds (10^7 ticks per second) */
@@ -1303,21 +955,21 @@ static const char *vms2unixtime( time_t vtime )
 	return ans;
 }
 
-void process_file ( unsigned char *buffer, int rsize )
+static void process_file_ctx(struct vmb_ctx *ctx, unsigned char *buffer, int rsize)
 {
 	unsigned char *data;
 	short dsize, dtype;
 	int ii, cc, subf=0;
 	int procf = 0;
 
-	close_file_ctx(current_ctx);
+	close_file_ctx(ctx);
 
 	/* check the header word */
 	if ( buffer[0] != 1 || buffer[1] != 1 )
 	{
 		printf ( "Snark: invalid file record header. Expected 01 01, found %02X %02X\n", buffer[0], buffer[1] );
-		skipping |= SKIP_TO_FILE; /* Skip to next file block */
-		++saveSet_errors;
+		ctx->skipping |= SKIP_TO_FILE; /* Skip to next file block */
+		++ctx->saveSet_errors;
 		return;
 	}
 
@@ -1325,50 +977,41 @@ void process_file ( unsigned char *buffer, int rsize )
 	while ( cc <= rsize-4 )
 	{
 		struct bsa *bsa;
-		int clen;
 
 		bsa = (struct bsa *)( buffer + cc );
-		dsize = GETU16( current_ctx, bsa->bsa_dol_w_size );
-		dtype = GETU16( current_ctx, bsa->bsa_dol_w_type );
+		dsize = GETU16( ctx, bsa->bsa_dol_w_size );
+		dtype = GETU16( ctx, bsa->bsa_dol_w_type );
 		data  = (unsigned char *)bsa->bsa_dol_t_text;
 
 		if ( dsize < 0 || dsize+cc+4 > rsize )
 		{
 			printf( "Snark: process_file() subfield %d, type %d, found bad count of %d.\n", subf, dtype, dsize );
-			++saveSet_errors;
-			skipping |= SKIP_TO_FILE; /* skip to next file block */
+			++ctx->saveSet_errors;
+			ctx->skipping |= SKIP_TO_FILE; /* skip to next file block */
 			return;
 		}
 		switch ( (int)dtype )
 		{
 		case FREC_END:
-#if 0
-			clen = cc+dsize+4;
-			if ( (vflag & VERB_FILE_RDLVL) && clen < rsize-4 )
-			{
-				printf( "Snark: Remaining %d bytes in FILE record...\n", rsize-clen-2 );
-				dump_chars( buffer+clen, rsize-clen-2 );
-			}
-#endif
-			if ( (vflag & VERB_FILE_RDLVL) )
+			if ( (ctx->vflag & VERB_FILE_RDLVL) )
 				printf( "File record field %2d, type END, size %d.\n", subf, dsize );
 			cc = rsize+1;
 			break;
 		case FREC_FNAME:
-			if ( dsize >= (int)sizeof(file.name) )
-				dsize = sizeof(file.name)-1;
-			memcpy ( file.name, data, dsize );
-			file.name[dsize] = '\0';
+			if ( dsize >= (int)sizeof(ctx->file.name) )
+				dsize = sizeof(ctx->file.name)-1;
+			memcpy ( ctx->file.name, data, dsize );
+			ctx->file.name[dsize] = '\0';
 			cc = rsize+1; /* force break out of loop */
 			break;
 		case FREC_UID:
-			if ( (vflag & VERB_FILE_RDLVL) )
+			if ( (ctx->vflag & VERB_FILE_RDLVL) )
 			{
 				int uid, gid;
 				uid = ((data[3]&0xFF)<<8) | (data[2]&0xFF);
 				gid = ((data[5]&0xFF)<<8) | (data[4]&0xFF);
 				printf( "File record field %2d, type UID, size %d. \"%s\" %06o,%06o\n",
-						subf, dsize, vms2unixtime(file.atime), gid, uid );
+						subf, dsize, vms2unixtime(ctx->file.atime), gid, uid );
 			}
 			break;
 		case FREC_FORMAT:
@@ -1376,62 +1019,62 @@ void process_file ( unsigned char *buffer, int rsize )
 			{
 				printf( "Snark: process_file(): subfield %d, type FORMAT, size %d. Bad format count.\n",
 						subf, dsize );
-				++saveSet_errors;
-				skipping |= SKIP_TO_FILE; /* skip to next file block */
+				++ctx->saveSet_errors;
+				ctx->skipping |= SKIP_TO_FILE; /* skip to next file block */
 				return;
 			}
-			file.recfmt = data[0];
-			file.recatt = data[1];
-			file.recsize = getu16( current_ctx, data+2 );
-			file.nblk = getu16( current_ctx, data+10 )
-			    + (64 * 1024) * getu16( current_ctx, data+8 );
-			file.lnch = getu16( current_ctx, data+12 );
-			if ( !file.nblk )
-				file.size = 0;
+			ctx->file.recfmt = data[0];
+			ctx->file.recatt = data[1];
+			ctx->file.recsize = getu16( ctx, data+2 );
+			ctx->file.nblk = getu16( ctx, data+10 )
+			    + (64 * 1024) * getu16( ctx, data+8 );
+			ctx->file.lnch = getu16( ctx, data+12 );
+			if ( !ctx->file.nblk )
+				ctx->file.size = 0;
 			else
-				file.size = (file.nblk-1) * 512 + file.lnch;
-			file.vfcsize = data[15];
-			if ( file.vfcsize == 0 )
-				file.vfcsize = 2;
-			if ( (vflag & VERB_FILE_RDLVL) )
+				ctx->file.size = (ctx->file.nblk-1) * 512 + ctx->file.lnch;
+			ctx->file.vfcsize = data[15];
+			if ( ctx->file.vfcsize == 0 )
+				ctx->file.vfcsize = 2;
+			if ( (ctx->vflag & VERB_FILE_RDLVL) )
 			{
 				printf( "File record field %2d, type FORMAT, size %d. fmt %d, att %d, rsiz %d\n",
-						subf, dsize, file.recfmt, file.recatt, file.recsize );
+						subf, dsize, ctx->file.recfmt, ctx->file.recatt, ctx->file.recsize );
 				printf( "                  nblk %d, lnch %d, vfcsize %d, filesize %d\n",
-					 file.nblk, file.lnch, file.vfcsize, file.size );
+					 ctx->file.nblk, ctx->file.lnch, ctx->file.vfcsize, ctx->file.size );
 			}
 			break;
 		case FREC_CTIME:
 			if ( dsize >= 8 )
-				file.ctime = vms2unixsecs( data );
-			if ( (vflag & VERB_FILE_RDLVL) )
+				ctx->file.ctime = vms2unixsecs( ctx, data );
+			if ( (ctx->vflag & VERB_FILE_RDLVL) )
 				printf( "File record field %2d, type CTIME, size %d. \"%s\"\n",
-						subf, dsize, vms2unixtime( file.ctime ) );
+						subf, dsize, vms2unixtime( ctx->file.ctime ) );
 			break;
 		case FREC_MTIME:
 			if ( dsize >= 8 )
-				file.mtime = vms2unixsecs( data );
-			if ( (vflag & VERB_FILE_RDLVL) )
+				ctx->file.mtime = vms2unixsecs( ctx, data );
+			if ( (ctx->vflag & VERB_FILE_RDLVL) )
 				printf( "File record field %2d, type MTIME, size %d. \"%s\"\n",
-						subf, dsize, vms2unixtime( file.mtime ) );
+						subf, dsize, vms2unixtime( ctx->file.mtime ) );
 			break;
 		case FREC_ATIME:
 			if ( dsize >= 8 )
-				file.atime = vms2unixsecs( data );
-			if ( (vflag & VERB_FILE_RDLVL) )
+				ctx->file.atime = vms2unixsecs( ctx, data );
+			if ( (ctx->vflag & VERB_FILE_RDLVL) )
 				printf( "File record field %2d, type ATIME, size %d. \"%s\"\n",
-						subf, dsize, vms2unixtime( file.atime ) );
+						subf, dsize, vms2unixtime( ctx->file.atime ) );
 			break;
 		case FREC_BTIME:
 			if ( dsize >= 8 )
-				file.btime = vms2unixsecs( data );
-			if ( (vflag & VERB_FILE_RDLVL) )
+				ctx->file.btime = vms2unixsecs( ctx, data );
+			if ( (ctx->vflag & VERB_FILE_RDLVL) )
 				printf( "File record field %2d, type BTIME, size %d. \"%s\"\n",
-						subf, dsize, vms2unixtime( file.btime ) );
+						subf, dsize, vms2unixtime( ctx->file.btime ) );
 			break;
 		case FREC_DIRECTORY:
-			file.directory = data[0];
-			if ( (vflag & VERB_FILE_RDLVL) )
+			ctx->file.directory = data[0];
+			if ( (ctx->vflag & VERB_FILE_RDLVL) )
 				printf( "File record field %2d, type DIRECTORY, size %d. 0x%02X\n",
 						subf, dsize, data[0] );
 			break;
@@ -1452,7 +1095,7 @@ void process_file ( unsigned char *buffer, int rsize )
 		case FREC_UNK4f:
 		case FREC_UNK50:
 		case FREC_UNK57:
-			if ( (vflag & VERB_FILE_RDLVL) )
+			if ( (ctx->vflag & VERB_FILE_RDLVL) )
 			{
 				int jj;
 				printf( "File record field %2d (UNK) type 0x%02X, size %d: ",
@@ -1473,58 +1116,63 @@ void process_file ( unsigned char *buffer, int rsize )
 		default:
 			printf( "Snark: process_file(): subfield %d, undefined record type: %d size %d\n",
 					subf, dtype, dsize );
-			++saveSet_errors;
+			++ctx->saveSet_errors;
 			break;
 		}
 		++subf;
 		cc += dsize + 4;
 	}
 
-	if ( strstr(file.name,".MAI") )
+	if ( strstr(ctx->file.name,".MAI") )
 	{
-		file.recfmt |= FAB_dol_M_MAIL;
-		file.savRecFmt = file.recfmt;
+		ctx->file.recfmt |= FAB_dol_M_MAIL;
+		ctx->file.savRecFmt = ctx->file.recfmt;
 	}
 	procf = 0;
-	if ( goptind < gargc )
+	if ( ctx->goptind < ctx->gargc )
 	{
-		for ( ii = goptind; ii < gargc; ii++ )
+		for ( ii = ctx->goptind; ii < ctx->gargc; ii++ )
 		{
-			procf |= match ( file.name, gargv[ii] );
+			procf |= match ( ctx->file.name, ctx->gargv[ii] );
 		}
 	}
 	else
 		procf = 1;
 	if ( procf )
 	{
-		if ( tflag )
+		if ( ctx->tflag )
 		{
 			char rfm[MAX_FORMAT_LEN];
-			getRfmRatt(&file,rfm,sizeof(rfm), cDelim);
-			printf ( " %-35s %8d (%s)%s\n", file.name, file.size, rfm, file.size < 0 ? " (IGNORED!!!)" : "" );
+			getRfmRatt(&ctx->file,rfm,sizeof(rfm), ctx->cDelim);
+			printf ( " %-35s %8d (%s)%s\n", ctx->file.name, ctx->file.size, rfm, ctx->file.size < 0 ? " (IGNORED!!!)" : "" );
 		}
-		if ( file.size < 0 )
+		if ( ctx->file.size < 0 )
 		{
-			if ( !tflag && xflag )
+			if ( !ctx->tflag && ctx->xflag )
 				printf ( "Snark: process_file(): %-35s not extracted due to filesize of %8d\n",
-					 file.name, file.size );
-			++file.file_size_error;
-			++saveSet_errors;
-			skipping |= SKIP_TO_FILE; /* this is bad */
+					 ctx->file.name, ctx->file.size );
+			++ctx->file.file_size_error;
+			++ctx->saveSet_errors;
+			ctx->skipping |= SKIP_TO_FILE; /* this is bad */
 			return;
 		}
-		if ( file.directory || (file.recfmt&FAB_dol_M_MAIL) )
+		if ( ctx->file.directory || (ctx->file.recfmt&FAB_dol_M_MAIL) )
 		{
-			if ( (vflag&VERB_FILE_RDLVL) )
+			if ( (ctx->vflag&VERB_FILE_RDLVL) )
 				printf( "Skipping file due to it being a dir or mail file or recsize is 0.\n" );
-			skipping |= SKIP_TO_FILE; /* ignore this file since the types are bogus */
+			ctx->skipping |= SKIP_TO_FILE; /* ignore this file since the types are bogus */
 			return;
 		}
-		if ( xflag )
+		if ( ctx->xflag )
 		{
-			file.extf = openfile ( &file );
-			if ( file.extf != NULL && vflag )
-				printf ( "extracting %s\n", file.name );
+			ctx->file.extf = openfile ( ctx, &ctx->file );
+			if ( ctx->file.extf != NULL && ctx->vflag )
+				printf ( "extracting %s\n", ctx->file.name );
 		}
 	}
+}
+
+void process_file ( unsigned char *buffer, int rsize )
+{
+	process_file_ctx(&g_ctx, buffer, rsize);
 }
