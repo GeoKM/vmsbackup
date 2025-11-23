@@ -422,6 +422,7 @@ struct vmb_ctx
 	char **gargv;
 	int goptind;
 	int gargc;
+	int tape_marks;			/* running bit mask of tape marks read */
 };
 
 static struct vmb_ctx g_ctx;
@@ -844,6 +845,7 @@ static void remove_dups( struct vmb_ctx *ctx )
 #define gargc (current_ctx->gargc)
 
 
+
 static int getRfmRatt(struct file_details *f, char *rcdFormat, int dstLen, char delim)
 {
 	int ii,rLen;
@@ -1066,55 +1068,8 @@ static FILE *openfile ( struct file_details *f )
 	{
 		strncat(f->altUPfName, rfm, sizeof(f->altUPfName) - 1);
 	}
-	if ( procf )
-	{
-		if ( dirfile )
-		{
-			procf = 0;			/* never explicitly extract directory files */
-			if ( (vflag & VERB_DEBUG_LVL) )
-			{
-				printf( "Skipping explicit extraction of \"%s\" because it's a directory.\n", p );
-			}
-		}
-		else
-		{
-			if ( ext && procf )
-			{
-				procf = typecmp(++ext, eflag);
-			}
-		}
-	}
-	if ( procf && wflag )
-	{
-		printf ( "extract %s [ny]", p );
-		fflush ( stdout );
-		fgets ( ans, sizeof ( ans ), stdin );
-		if ( *ans != 'y' )
-			procf = 0;
-	}
-	if ( procf )
-	{
-		FILE *fp;
-		fp = fopen(p,"wb");
-		if ( !fp )
-		{
-			printf("Snark: Failed to open '%s' for output: %s\n", f->ufname, strerror(errno));
-		}
-		else if ( !binaryFlag && f->altUPfName[0])
-		{
-			f->altf = fopen(f->altUPfName,"wb");
-			if ( !f->altf )
-			{
-				fclose(fp);
-				unlink(f->ufname);
-				printf("Snark: Failed to open '%s' for output: %s\n", f->altUPfName, strerror(errno));
-				fp = NULL;
-			}
-		}
-		return fp;
-	}
-	else
-		return( NULL );
+	process_file_ctx(current_ctx);
+
 }
 
 /**
@@ -1202,128 +1157,176 @@ int typecmp ( const char *str, int which )
  * errors if they can be detected at this point.
  */
 
-static void close_file( void )
-{
-/*    int rfmt; */
+#undef file
+#undef xflag
+#undef vflag
+#undef skipping
+#undef binaryFlag
+#undef cDelim
 
-	skipping &= ~SKIP_TO_FILE;
-/*    rfmt = file.recfmt&0x1f; */
-	if ( !file.directory && !(file.savRecFmt&FAB_dol_M_MAIL) )
+static void close_file_ctx( struct vmb_ctx *ctx )
+{
+	ctx->skipping &= ~SKIP_TO_FILE;
+	if ( !ctx->file.directory && !(ctx->file.savRecFmt&FAB_dol_M_MAIL) )
 	{
-		if ( (xflag || file.inboundIndex) && file.inboundIndex != file.size )
+		if ( (ctx->xflag || ctx->file.inboundIndex) && ctx->file.inboundIndex != ctx->file.size )
 		{
 			printf( "Snark: '%s' file size is not correct. Is %d, should be %d. May be corrupt.\n",
-					file.name, file.inboundIndex, file.size );
-			++file.file_size_error;
+					ctx->file.name, ctx->file.inboundIndex, ctx->file.size );
+			++ctx->file.file_size_error;
 		}
-		if ( (vflag & VERB_FILE_RDLVL) )
+		if ( (ctx->vflag & VERB_FILE_RDLVL) )
 		{
 			printf( "File size: %d(0x%X), inboundIndex: %d(0x%X), outbountIndex: %d(0x%X), padding: %d, rec_count: %d\n",
-					 file.size
-					,file.size
-					,file.inboundIndex
-					,file.inboundIndex
-					,file.outboundIndex
-					,file.outboundIndex
-					,file.rec_padding
-					,file.rec_count
-					);
+					ctx->file.size,
+					ctx->file.size,
+					ctx->file.inboundIndex,
+					ctx->file.inboundIndex,
+					ctx->file.outboundIndex,
+					ctx->file.outboundIndex,
+					ctx->file.rec_padding,
+					ctx->file.rec_count );
 		}
 	}
-	if ( file.extf != NULL )    /* if file previously opened */
+	if ( ctx->file.extf != NULL )
 	{
 		struct utimbuf ut;
 
-		fclose ( file.extf );	/* close it */
-		file.extf = NULL;
-		ut.actime = file.atime;
-		ut.modtime = file.mtime;
-		utime( file.ufname, &ut );
-		if ( file.altf )
+		fclose ( ctx->file.extf );
+		ctx->file.extf = NULL;
+		ut.actime = ctx->file.atime;
+		ut.modtime = ctx->file.mtime;
+		utime( ctx->file.ufname, &ut );
+		if ( ctx->file.altf )
 		{
-			fclose(file.altf);
-			file.altf = NULL;
-			utime(file.altUPfName, &ut);
+			fclose(ctx->file.altf);
+			ctx->file.altf = NULL;
+			utime(ctx->file.altUPfName, &ut);
 		}
-		if ( (!binaryFlag && file.do_binary) || file.file_record_error || file.file_size_error || file.file_blk_error || file.file_format_error )
+		if ( (!ctx->binaryFlag && ctx->file.do_binary) || ctx->file.file_record_error || ctx->file.file_size_error || ctx->file.file_blk_error || ctx->file.file_format_error )
 		{
 			char refilename[MAX_FILENAME_LEN+MAX_FORMAT_LEN+32];
 			int rLen, sLen, rName=0;
 
-			if ( file.altUPfName[0] )
+			if ( ctx->file.altUPfName[0] )
 			{
-				int pLen = file.altUfNameOnly-file.altUPfName;	/* length of path */
-				int sLen = strlen(file.altUfNameOnly+1);
-				memcpy(refilename,file.altUPfName,pLen);		/* copy path only */
-				refilename[pLen] = 0;							/* terminate path */
-				memcpy(refilename + pLen, file.altUfNameOnly+1, sLen); /* copy name sans leading '.' */
-				refilename[pLen+sLen] = 0;						/* terminate filename */
+				int pLen = ctx->file.altUfNameOnly-ctx->file.altUPfName; /* length of path */
+				int sLen = strlen(ctx->file.altUfNameOnly+1);
+				memcpy(refilename,ctx->file.altUPfName,pLen); /* copy path only */
+				refilename[pLen] = 0; /* terminate path */
+				memcpy(refilename + pLen, ctx->file.altUfNameOnly+1, sLen); /* copy name sans leading '.' */
+				refilename[pLen+sLen] = 0; /* terminate filename */
 			}
 			else
 			{
-				strncpy(refilename, file.ufname, sizeof(refilename) - 1);
+				strncpy(refilename, ctx->file.ufname, sizeof(refilename) - 1);
 			}
 			sLen = rLen = strlen(refilename);
-			if ( file.file_record_error )
+			if ( ctx->file.file_record_error )
 			{
-				if ( file.altUPfName[0] )
-					rLen += snprintf(refilename + rLen, sizeof(refilename) - rLen, "%cisCorruptAt%c%d", cDelim, cDelim, file.altErrorIndex);
+				if ( ctx->file.altUPfName[0] )
+					rLen += snprintf(refilename + rLen, sizeof(refilename) - rLen, "%cisCorruptAt%c%d", ctx->cDelim, ctx->cDelim, ctx->file.altErrorIndex);
 				else
-					rLen += snprintf(refilename + rLen, sizeof(refilename) - rLen, "%cisCorruptAt%c%d", cDelim, cDelim, file.errorIndex);
+					rLen += snprintf(refilename + rLen, sizeof(refilename) - rLen, "%cisCorruptAt%c%d", ctx->cDelim, ctx->cDelim, ctx->file.errorIndex);
 			}
-			else if ( file.file_size_error )
-				rLen += snprintf(refilename + rLen, sizeof(refilename) - rLen, "%cwrongSize", cDelim);
-			else if ( file.file_blk_error )
-				rLen += snprintf(refilename + rLen, sizeof(refilename) - rLen, "%cfailedBlkDecode", cDelim);
-			else if ( file.file_format_error )
-				rLen += snprintf(refilename + rLen, sizeof(refilename) - rLen, "%cundefinedFormat", cDelim);
-			rName = rLen != sLen;	/* Check to see if anything changed */
-			if ( file.altUPfName[0] )
+			else if ( ctx->file.file_size_error )
+				rLen += snprintf(refilename + rLen, sizeof(refilename) - rLen, "%cwrongSize", ctx->cDelim);
+			else if ( ctx->file.file_blk_error )
+				rLen += snprintf(refilename + rLen, sizeof(refilename) - rLen, "%cfailedBlkDecode", ctx->cDelim);
+			else if ( ctx->file.file_format_error )
+				rLen += snprintf(refilename + rLen, sizeof(refilename) - rLen, "%cunknownRFM", ctx->cDelim);
+			if ( rLen != sLen )
 			{
-				/* We wrote a binary file with the altUfName */
-				unlink(file.ufname);	/* toss the normal output file */
-				rename(file.altUPfName, refilename); /* and make the binary file the one we want */
 				rName = 1;
+				rename( ctx->file.ufname, refilename );
 			}
-			else
+			if ( ctx->file.altUPfName[0] )
 			{
-				if ( file.altUPfName[0] )
-					unlink(file.altUPfName); /* The ordinary output is okay, so toss the binary version */
-				/* if a rename is required, do it. */
-				if ( rName )
-					rename(file.ufname, refilename);
+				if ( rename( ctx->file.altUPfName, refilename ) == 0 )
+					rName |= 2;
 			}
-			if ( rName )
-			{
-				if ( file.file_record_error || file.file_blk_error || file.file_size_error )
-					printf( "Snark: close_file(): Found file errors during copy. Renamed '%s' to '%s'\n",
-							 file.ufname ,refilename );
-				else
-					printf( "Snark: close_file(): Forced binary mode. Renamed '%s' to '%s'\n",
-						   file.ufname, refilename);
-			}
-			else
-				printf( "Snark: close_file(): Forced binary mode. File renamed to '%s'\n",
-					   file.ufname);
-		}
-		else
-		{
-			if ( file.altUPfName[0] )
-				unlink(file.altUPfName);
+			if ( rName == 1 )
+				unlink(ctx->file.altUPfName);
+			else if ( rName == 2 )
+				unlink(ctx->file.ufname);
 		}
 	}
-	memset( &file, 0, sizeof( file ) );
 }
 
-/**
- * Convert the 64 bit VMS time to the 32 bit unix time.
- *
- * @param text Pointer to 8 byte VMS timestamp in VAX format.
- *
- * @return
- *	0 if no time specified.
- *	non-zero unix time in seconds since 1-jan-1970:00:00:00 GMT.
- */
+#define file (current_ctx->file)
+#define xflag (current_ctx->xflag)
+#define vflag (current_ctx->vflag)
+#define skipping (current_ctx->skipping)
+#define binaryFlag (current_ctx->binaryFlag)
+#define cDelim (current_ctx->cDelim)
+
+static void close_file(void)
+{
+	close_file_ctx(current_ctx);
+}
+
+/* Context-aware file processing wrapper. */
+static void process_file_ctx(struct vmb_ctx *ctx)
+{
+	int procf = 0;
+
+	current_ctx = ctx;
+
+	if ( strstr(ctx->file.name,".MAI") )
+	{
+		ctx->file.recfmt |= FAB_dol_M_MAIL;
+		ctx->file.savRecFmt = ctx->file.recfmt;
+	}
+	if ( ctx->goptind < ctx->gargc )
+	{
+		int ii;
+		for ( ii = ctx->goptind; ii < ctx->gargc; ii++ )
+		{
+			procf |= match ( ctx->file.name, ctx->gargv[ii] );
+		}
+	}
+	else
+	{
+		procf = 1;
+	}
+	if ( !procf )
+		return;
+
+	if ( ctx->tflag )
+	{
+		char rfm[MAX_FORMAT_LEN];
+		getRfmRatt(&ctx->file, rfm, sizeof(rfm), ctx->cDelim);
+		printf ( " %-35s %8d (%s)%s\n", ctx->file.name, ctx->file.size, rfm, ctx->file.size < 0 ? " (IGNORED!!!)" : "" );
+	}
+	if ( ctx->file.size < 0 )
+	{
+		if ( !ctx->tflag && ctx->xflag )
+			printf ( "Snark: process_file(): %-35s not extracted due to filesize of %8d\n",
+					 ctx->file.name, ctx->file.size );
+		++ctx->file.file_size_error;
+		++ctx->saveSet_errors;
+		ctx->skipping |= SKIP_TO_FILE;	/* this is bad */
+		return;
+	}
+	if ( ctx->file.directory || (ctx->file.recfmt&FAB_dol_M_MAIL) )
+	{
+		ctx->skipping |= SKIP_TO_FILE;	/* ignore this file since the types are bogus */
+		if ( (ctx->vflag&VERB_FILE_RDLVL) )
+		{
+			printf( "Skipping file due to it being a dir or mail file or recsize is 0.\n" );
+		}
+		return;
+	}
+
+	if ( ctx->xflag )
+	{
+		/* open file */
+		ctx->file.extf = openfile ( &ctx->file );
+		if ( ctx->file.extf != NULL && ctx->vflag )
+			printf ( "extracting %s\n", ctx->file.name );
+	}
+}
+
 static time_t vms2unixsecs( unsigned char *text )
 {
 	unsigned long long vmstime, vmsepoch;
@@ -2584,8 +2587,6 @@ void process_block ( unsigned char *blkptr )
 	}
 }
 
-static int tape_marks;		/*!< running bit mask of tape marks read */
-
 /**
  * Get a record from tape or disk.
  *
@@ -2601,26 +2602,28 @@ static int tape_marks;		/*!< running bit mask of tape marks read */
  * Will not advance beyond two consequitive tape marks.
  */
 
-static int read_record( unsigned char *buff, int len )
+static int read_record( struct vmb_ctx *ctx, unsigned char *buff, int len )
 {
 	unsigned char freclen[4], iFreclen[4];
 	int sts, tmpLen, reclen, Ireclen;
 #if  1 || WIN32
 	int tmpRecCnt;
 #endif
-	if ( (tape_marks&3) == 3 )
+
+	current_ctx = ctx;
+	if ( (ctx->tape_marks&3) == 3 )
 	{
 		if ( (vflag & VERB_DEBUG_LVL) )
 			printf( "read_record: returns 0 cuz read 2 TMs in a row.\n" );
 		return 0;				/* reached EOT, can't advance */
 	}
-	tape_marks <<= 1;
+	ctx->tape_marks <<= 1;
 	if ( !iflag && !Iflag )
 	{
 		sts = read( fd, buff, len );		/* Read from the tape */
 		if ( sts <= 0 )				/* A 0 is a tape mark, a -x is an error */
 		{
-			tape_marks |= 1;
+			ctx->tape_marks |= 1;
 		}
 		if ( (vflag & VERB_DEBUG_LVL) )
 			printf( "read_record: returns %d.\n", sts );
@@ -2634,7 +2637,7 @@ static int read_record( unsigned char *buff, int len )
 	sts = read( fd, freclen, 4 );		/* Read the record length from disk */
 	if ( sts <= 0 )				/* A 0 is EOF. a -x is an error */
 	{
-		tape_marks |= 1;			/* pretend we got a tape mark */
+		ctx->tape_marks |= 1;			/* pretend we got a tape mark */
 		if ( (vflag & VERB_DEBUG_LVL) )
 			printf( "read_record: returns %d due to error or EOF.\n", sts );
 		return sts;
@@ -2642,7 +2645,7 @@ static int read_record( unsigned char *buff, int len )
 	reclen = getu32( current_ctx, freclen );			/* convert endianess as appropriate */
 	if ( !reclen )				/* A 0 length record is a fake tape mark */
 	{
-		tape_marks |= 1;			/* Reached a fake tape mark */
+		ctx->tape_marks |= 1;			/* Reached a fake tape mark */
 		if ( (vflag & VERB_DEBUG_LVL) )
 			printf( "read_record: returns 0 cuz found fake TM.\n" );
 		return 0;
@@ -2666,7 +2669,7 @@ static int read_record( unsigned char *buff, int len )
 		sts = read(fd, buff+tmpLen, len-tmpLen);
 		if ( sts <= 0 )
 		{
-			tape_marks |= 1;			/* pretend we got a tape mark */
+			ctx->tape_marks |= 1;			/* pretend we got a tape mark */
 			if ( (vflag & VERB_DEBUG_LVL) )
 				printf( "read_record: read(%d) returns %d due to error or EOF on attempt %d. tmpLen=%d\n", len-tmpLen, sts, tmpRecCnt, tmpLen );
 			return sts;
@@ -2680,7 +2683,7 @@ static int read_record( unsigned char *buff, int len )
 	tmpLen = read(fd, buff, len);
 	if ( tmpLen <= 0 )
 	{
-		tape_marks |= 1;			/* pretend we got a tape mark */
+			ctx->tape_marks |= 1;			/* pretend we got a tape mark */
 		if ( (vflag & VERB_DEBUG_LVL) )
 			printf( "read_record: read() returns %d due to error or EOF.\n", sts );
 		return tmpLen;
@@ -2722,7 +2725,7 @@ static void skip_to_tm( void )
 {
 	while ( 1 )
 	{
-		if ( !read_record( (unsigned char *)label, sizeof( label ) ) )
+		if ( !read_record( current_ctx, (unsigned char *)label, sizeof( label ) ) )
 			break;
 	}
 }
@@ -2803,11 +2806,12 @@ static void alloc_buffers( int nbuffs, int buffsize )
  *	@arg -1 No more savesets to look for.
  */
 
-int rdhead ( void )
+int rdhead ( struct vmb_ctx *ctx )
 {
 	int marks=0, mstop, len, nfound, rptd=0, stm=0;
 	char name[80];
 
+	current_ctx = ctx;
 	skipping = 0;
 	total_errors += saveSet_errors;
 	saveSet_errors = 0;
@@ -2820,7 +2824,7 @@ int rdhead ( void )
 	while ( 1 )
 	{
 		marks <<= 1;
-		len = read_record( (unsigned char *)label, sizeof(label) );
+		len = read_record( current_ctx, (unsigned char *)label, sizeof(label) );
 		if ( !len )
 		{
 			marks |= 1;
@@ -2949,9 +2953,14 @@ int rdhead ( void )
  * @return nothing.
  */
 
-static void end_of_saveset( char *ssname )
+#undef vflag
+#undef tflag
+#undef saveSet_errors
+#undef skipping
+
+static void end_of_saveset( struct vmb_ctx *ctx, char *ssname )
 {
-	if ( vflag || tflag || saveSet_errors )
+	if ( ctx->vflag || ctx->tflag || ctx->saveSet_errors )
 	{
 		char name[80];
 		if ( ssname )
@@ -2963,10 +2972,12 @@ static void end_of_saveset( char *ssname )
 		{
 			strcpy( name, "Unknown" );
 		}
-		if ( saveSet_errors )
+		if ( ctx->saveSet_errors )
+		{
 			printf( "Snark: Found %d error%s in saveset \"%s\"\n",
-					saveSet_errors, saveSet_errors > 1 ? "s" : "", name );
-		if ( vflag || tflag )
+					ctx->saveSet_errors, ctx->saveSet_errors > 1 ? "s" : "", name );
+		}
+		if ( ctx->vflag || ctx->tflag )
 			printf ( "End of saveset: %s\n\n\n", name );
 	}
 }
@@ -2978,27 +2989,33 @@ static void end_of_saveset( char *ssname )
  * @return nothing.
  */
 
-void rdtail ( void )
+void rdtail ( struct vmb_ctx *ctx )
 {
 	int len;
 
+	current_ctx = ctx;
 	close_file();
 	/* read the tape label - 4 records of 80 bytes */
-	while ( ( len = read_record( (unsigned char *)label, sizeof(label) ) ) != 0 )
+	while ( ( len = read_record( current_ctx, (unsigned char *)label, sizeof(label) ) ) != 0 )
 	{
 		if ( len != LABEL_SIZE )
 		{
 			printf ( "Snark: rdtail(): bad EOF label record. Expected %d bytes got %d.\n", LABEL_SIZE, len );
-			skipping |= SKIP_TO_SAVESET;
-			end_of_saveset( NULL );
+			ctx->skipping |= SKIP_TO_SAVESET;
+			end_of_saveset( ctx, NULL );
 			break;
 		}
 		if ( strncmp ( label, "EOF1", 4 ) == 0 )
 		{
-			end_of_saveset( label );
+			end_of_saveset( ctx, label );
 		}
 	}
 }
+
+#define vflag (current_ctx->vflag)
+#define tflag (current_ctx->tflag)
+#define saveSet_errors (current_ctx->saveSet_errors)
+#define skipping (current_ctx->skipping)
 
 #define NXT_BLK_OK	(0)	/*!< block is ok to decode */
 #define NXT_BLK_EOT	(1)	/*!< we're at EOT */
@@ -3020,17 +3037,19 @@ void rdtail ( void )
  * This function will keep all buffers full with tape data at all times.
  */
 
-static int read_next_block( )
+static int read_next_block( struct vmb_ctx *ctx )
 {
 	unsigned long numb0;
 	struct buff_ctl *bptr;
 	int ra, hittm=0;
 
+	current_ctx = ctx;
+
 	if ( !busybuffs )		/* if first time through, need to rdhead() then fill n buffers */
 	{
-		if ( rdhead (  ) )	/* read header */
+		if ( rdhead ( ctx ) )	/* read header */
 			return NXT_BLK_EOT;	/* reached eot */
-		bptr = getfree_buff(current_ctx);
+		bptr = getfree_buff(ctx);
 		if ( !bptr )
 		{
 			printf( "Snark: Fatal internal error. No more free buffs.\n" );
@@ -3039,10 +3058,10 @@ static int read_next_block( )
 		}
 		while ( 1 )
 		{
-			bptr->amt = read_record( bptr->buffer, buffalloc );	/* fill first buffer */
+			bptr->amt = read_record( ctx, bptr->buffer, buffalloc );	/* fill first buffer */
 			if ( !bptr->amt )
 			{
-				free_buff(current_ctx, bptr );				/* put this back */
+				free_buff(ctx, bptr );				/* put this back */
 				return NXT_BLK_TM;				/* found tm */
 			}
 			if ( bptr->amt == blocksize )           /* block is ok so far */
@@ -3052,7 +3071,7 @@ static int read_next_block( )
 					continue;					/* not a valid block, skip it */
 				if ( numb0 != 1 )				/* it had better be a 1 */
 				{
-					free_buff(current_ctx, bptr );				/* put this back */
+					free_buff(ctx, bptr );				/* put this back */
 					return NXT_BLK_NOLEAD;			/* no leading block */
 				}
 				break;
@@ -3060,12 +3079,12 @@ static int read_next_block( )
 			printf ( "Snark: record size incorrect. read amt = %d, expected %d\n", bptr->amt, blocksize );
 		}
 		bptr->blknum = 1;					/* always starts with block 1 */
-		add_busybuff( current_ctx, bptr, 0 );				/* put this on the busy queue */
+		add_busybuff( ctx, bptr, 0 );				/* put this on the busy queue */
 	}
 	bptr = buffers+busybuffs;		/* point to top item on queue */
 	if ( !bptr->amt )			/* if top buffer is a TM */
 	{
-		free_buff(current_ctx, popbusy_buff(current_ctx) );	/* toss the top item */
+		free_buff(ctx, popbusy_buff(current_ctx) );	/* toss the top item */
 		return NXT_BLK_TM;		/* return eof */
 	}
 	while ( bptr->next )		/* find last item on busy queue */
@@ -3076,7 +3095,7 @@ static int read_next_block( )
 	{
 		for ( ra=num_busys; !hittm && ra < MAX_BUFFCOUNT; ++ra )	/* may need to readahead n buffers */
 		{
-			bptr = getfree_buff(current_ctx);		/* get a free buffer */
+			bptr = getfree_buff(ctx);		/* get a free buffer */
 			if ( !bptr )
 			{
 				printf( "Snark: Fatal internal error. Ran out of free buffs.\n" );
@@ -3085,7 +3104,7 @@ static int read_next_block( )
 			}
 			while ( !hittm )
 			{
-				bptr->amt = read_record( bptr->buffer, buffalloc );	/* fill it up */
+				bptr->amt = read_record( ctx, bptr->buffer, buffalloc );	/* fill it up */
 				if ( !bptr->amt )		/* reached TM on readahead */
 				{
 					hittm = 1;			/* can't read anymore */
@@ -3102,16 +3121,16 @@ static int read_next_block( )
 						 bptr->amt, blocksize );
 			}
 			if ( !hittm )
-				add_busybuff( current_ctx, bptr, 0 );	/* append the buffer to busy queue */
+				add_busybuff( ctx, bptr, 0 );	/* append the buffer to busy queue */
 			else
-				free_buff(current_ctx, bptr );		/* toss this for now */
+				free_buff(ctx, bptr );		/* toss this for now */
 		}
-		remove_dups(current_ctx);				/* account for missing & duplicates in busy queue */
+		remove_dups(ctx);				/* account for missing & duplicates in busy queue */
 	}
 	if ( hittm )			/* if we've hit a TM */
 	{
-		bptr = getfree_buff(current_ctx);
-		add_busybuff( current_ctx, bptr, 0 );	/* stick a TM at end of busy queue */
+		bptr = getfree_buff(ctx);
+		add_busybuff( ctx, bptr, 0 );	/* stick a TM at end of busy queue */
 	}
 	return NXT_BLK_OK;			/* we've got a good record */
 }
@@ -3467,14 +3486,14 @@ static int vmsbackup_entry(struct vmb_ctx *ctx, int argc, char *argv[])
 	{
 		struct buff_ctl *bptr;
 		bptr = NULL;
-		eoffl = read_next_block();
+		eoffl = read_next_block(current_ctx);
 		switch ( eoffl )
 		{
 		case NXT_BLK_EOT:		/* reached EOT */
 			eoffl = 1;		/* we're done */
 			continue;
 		case NXT_BLK_TM:		/* reached a TM */
-			rdtail (  );		/* read EOF labels */
+			rdtail(current_ctx);		/* read EOF labels */
 			freeall(current_ctx);		/* reset for next saveset */
 			skipping = 0;		/* not skipping anything now */
 			eoffl = 0;
@@ -3509,7 +3528,7 @@ static int vmsbackup_entry(struct vmb_ctx *ctx, int argc, char *argv[])
 		if ( bptr )
 		{
 			process_block ( bptr->buffer );
-			free_buff(current_ctx, bptr );
+			free_buff(ctx, bptr );
 		}
 	}
 	close_file();
