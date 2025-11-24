@@ -197,6 +197,14 @@
 
 extern int match ( const char *string, const char *pattern );
 static int typecmp ( const char *str, int which );
+static void usage ( const char *progname, int details );
+static unsigned long get_block_number( struct vmb_ctx *ctx, unsigned char *bptr );
+
+#if defined(__GNUC__) || defined(__clang__)
+#define UNUSED __attribute__((unused))
+#else
+#define UNUSED
+#endif
 
 #define MAX_FILENAME_LEN (128)
 #define MAX_FORMAT_LEN	 (16)
@@ -263,6 +271,50 @@ typedef enum
 	GET_VFC,
 	GET_DATA
 } FileState_t;
+
+typedef enum
+{
+	 OPT_UNDEFINED
+	,OPT_DVD			/* -i */
+	,OPT_EXTRACT		/* --extract */
+	,OPT_FILE			/* -f */
+	,OPT_HDR1_NUMBER	/* -s */
+	,OPT_LIST			/* -t */
+	,OPT_SET_NAME		/* -n */
+	,OPT_SIMH			/* -I */
+	,OPT_VER_DELIMIT	/* --delimiter */
+	,OPT_VERBOSE		/* -v */
+	,OPT_PROMPT			/* -w */
+	,OPT_NO_VERSION		/* -R */
+	,OPT_HIERARCHY		/* -d */
+	,OPT_BINARY			/* -B */
+	,OPT_FFRM			/* -E */
+	,OPT_LOWERCASE		/* -l */
+	,OPT_RECFMT			/* -F */
+	,OPT_HELP			/* -h */
+} Options_t;
+
+static struct option long_options[] =
+{
+	{ "dvd",		no_argument,		0, OPT_DVD },
+	{ "extract",	required_argument,	0, OPT_EXTRACT },
+	{ "file",		required_argument,	0, OPT_FILE },
+	{ "hdr1",		required_argument,	0, OPT_HDR1_NUMBER },
+	{ "list",		no_argument,		0, OPT_LIST },
+	{ "setname",	required_argument,	0, OPT_SET_NAME },
+	{ "simh",		no_argument,		0, OPT_SIMH },
+	{ "delimiter",	optional_argument,	0, OPT_VER_DELIMIT },
+	{ "verbose",	required_argument,	0, OPT_VERBOSE },
+	{ "prompt",		no_argument,		0, OPT_PROMPT },
+	{ "noversions",	no_argument,		0, OPT_NO_VERSION },
+	{ "lowercase",	no_argument,		0, OPT_LOWERCASE },
+	{ "hierarchy",	no_argument,		0, OPT_HIERARCHY },
+	{ "binary",		no_argument,		0, OPT_BINARY },
+	{ "ffrm",		no_argument,		0, OPT_FFRM },
+	{ "record",		required_argument,	0, OPT_RECFMT },
+	{ "help",		no_argument,		0, OPT_HELP },
+	{ 0, 0, 0, 0 }
+};
 
 struct file_details
 {
@@ -379,6 +431,12 @@ struct file_details
 #define SKIP_TO_BLOCK	(2)	/*!< Skip to next block */
 #define SKIP_TO_SAVESET	(4)	/*!< Skip to next saveset */
 
+#define NXT_BLK_OK	(0)	/*!< block is ok to decode */
+#define NXT_BLK_EOT	(1)	/*!< we're at EOT */
+#define NXT_BLK_TM	(2)	/*!< we're at a TM */
+#define NXT_BLK_NOLEAD	(3)	/*!< no leading block */
+#define NXT_BLK_ERR	(4)	/*!< generic error */
+
 /* Bit mask of verbosity levels set in vflag */
 #define VERB_LVL	(1)	/* verbose */
 #define VERB_FILE_RDLVL	(2)	/* verbose on record read processing */
@@ -390,9 +448,10 @@ struct file_details
 
 #define	LABEL_SIZE	80
 
-struct buff_ctl;
-
-struct buff_ctl;
+/* Default number of lookahead buffers. */
+#ifndef MAX_BUFFCOUNT
+#define MAX_BUFFCOUNT (10)
+#endif
 
 struct vmb_ctx
 {
@@ -420,17 +479,7 @@ struct vmb_ctx
 };
 
 static struct vmb_ctx g_ctx;
-
-/*
- * Someday, one might want to make MAX_BUFFCOUNT dynamic and get the actual
- * value from the /BUFF field of the backup command (as reported in the
- * summary record). For now, I just picked something that seemed reasonable.
- */
-#ifndef MAX_BUFFCOUNT
-	#define MAX_BUFFCOUNT (10)	/*!< Number of look ahead buffers */
-#endif
-
-/* A 'buffer' is actually a struct buff_ctl */
+static unsigned long last_block_number;
 
 struct buff_ctl
 {
@@ -470,6 +519,420 @@ static unsigned int getu16 ( struct vmb_ctx *ctx, unsigned char *addr )
 }
 
 #define GETU16(ctx,x) getu16( ctx, (unsigned char *)&(x) )
+
+/**
+ * Dump the contents (indices only) of the busy and free queues for debugging.
+ */
+static __attribute__((unused)) void dump_queues( struct vmb_ctx *ctx, int which )
+{
+	if ( (ctx->vflag&VERB_QUEUE_LVL) )
+	{
+		int idx;
+		struct buff_ctl *bptr;
+		if ( (which&1) )
+		{
+			printf( " Busy queue (%d): ", ctx->busybuffs );
+			idx = ctx->busybuffs;
+			while ( idx )
+			{
+				printf( "%d ", idx );
+				bptr = ctx->buffers + idx;
+				idx = bptr->next;
+			}
+			printf( "\n" );
+		}
+		if ( (which&2) )
+		{
+			printf( " Free queue (%d): ", ctx->freebuffs );
+			idx = ctx->freebuffs;
+			while ( idx )
+			{
+				printf( "%d ", idx );
+				bptr = ctx->buffers + idx;
+				idx = bptr->next;
+			}
+			printf( "\n" );
+		}
+	}
+}
+
+static __attribute__((unused)) struct buff_ctl *popbusy_buff(struct vmb_ctx *ctx)
+{
+	struct buff_ctl *bptr;
+	if ( !ctx->busybuffs )
+	{
+		if ( (ctx->vflag&VERB_QUEUE_LVL) )
+		{
+			printf( "popbusy_buff(): No items on queue.\n" );
+			dump_queues(ctx, 3 );
+		}
+		return NULL;
+	}
+	bptr = ctx->buffers + ctx->busybuffs;
+	ctx->busybuffs = bptr->next;
+	bptr->next = 0;
+	--ctx->num_busys;
+	if ( (ctx->vflag&VERB_QUEUE_LVL) )
+	{
+		printf( "popbusy_buff(): popped %ld off busy queue. num_busys now %d\n",
+				(long)(bptr-ctx->buffers), ctx->num_busys );
+		dump_queues(ctx, 3 );
+	}
+	return bptr;
+}
+
+static __attribute__((unused)) void add_busybuff( struct vmb_ctx *ctx, struct buff_ctl *bptr, int front )
+{
+	int prev, ii;
+
+	++ctx->num_busys;
+	if ( (ctx->vflag&VERB_QUEUE_LVL) )
+	{
+		printf( "add_busybuff(): Added item %ld to %s of busy queue. num_busys now %d\n",
+				(long)(bptr - ctx->buffers), front ? "head" : "tail", ctx->num_busys );
+	}
+	if ( front )
+	{
+		bptr->next = ctx->busybuffs;
+		ctx->busybuffs = bptr-ctx->buffers;
+	}
+	else
+	{
+		prev = 0;
+		ii = ctx->busybuffs;
+		bptr->next = 0;		/* make sure this is off */
+		while ( ii )		/* walk the chain */
+		{
+			prev = ii;		/* remember this */
+			ii = ctx->buffers[ii].next;	/* advance to next */
+		}
+		if ( prev )			/* if there was a chain */
+			ctx->buffers[prev].next = bptr-ctx->buffers; /* link it */
+		else
+			ctx->busybuffs = bptr-ctx->buffers; /* else we are on top */
+	}
+	dump_queues(ctx, 3 );
+}
+
+static __attribute__((unused)) struct buff_ctl *getfree_buff(struct vmb_ctx *ctx)
+{
+	struct buff_ctl *bptr;
+	if ( !ctx->freebuffs )
+	{
+		if ( (ctx->vflag&VERB_QUEUE_LVL) )
+		{
+			printf( "getfree_buff(): Nothing on free list!!! num_busys now %d\n", ctx->num_busys );
+			dump_queues(ctx, 3 );
+		}
+		return NULL;
+	}
+	bptr = ctx->buffers + ctx->freebuffs;
+	ctx->freebuffs = bptr->next;
+	bptr->next = 0;
+	bptr->amt = 0;
+	bptr->blknum = 0;
+	if ( (ctx->vflag&VERB_QUEUE_LVL) )
+	{
+		printf( "getfree_buff(): Extracted %ld from freelist. num_busys now %d\n",
+				(long)(bptr-ctx->buffers), ctx->num_busys );
+		dump_queues(ctx, 3 );
+	}
+	return bptr;
+}
+
+static void free_buff( struct vmb_ctx *ctx, struct buff_ctl *bptr )
+{
+	if ( bptr )
+	{
+		bptr->next = ctx->freebuffs;
+		ctx->freebuffs = bptr - ctx->buffers;
+		if ( (ctx->vflag&VERB_QUEUE_LVL) )
+		{
+			printf( "free_buff(): Put %ld on freelist. num_busys now %d\n", (long)(bptr - ctx->buffers), ctx->num_busys );
+			dump_queues(ctx, 3 );
+		}
+	}
+}
+
+static __attribute__((unused)) void freeall( struct vmb_ctx *ctx )
+{
+	if ( ctx->buffers )
+	{
+		struct buff_ctl *bp;
+		int ii;
+		bp = ctx->buffers+1;
+		for ( ii=1; ii < ctx->num_buffers-1; ++ii, ++bp )
+			bp->next = ii+1;
+		bp->next = 0;
+		ctx->freebuffs = 1;
+		ctx->busybuffs = 0;
+		if ( (ctx->vflag&VERB_QUEUE_LVL) )
+		{
+			printf( "freeall(): Free'd all buffers.\n" );
+			dump_queues(ctx, 3 );
+		}
+	}
+}
+
+static __attribute__((unused)) void remove_dups( struct vmb_ctx *ctx )
+{
+	int ii, lim, jj;
+	struct buff_ctl *bptr, *la;
+	int buffs[10];		/* place to hold clone of buffer layout (MAX_BUFFCOUNT was 10) */
+
+	if ( ctx->num_busys <= 1 )
+		return;				/* nothing to do if there's only one item */
+	memset( buffs, 0, sizeof(buffs) );	/* preclear local array */
+	buffs[0] = ctx->busybuffs;
+	bptr = ctx->buffers + ctx->busybuffs;
+	lim = 1;
+	while ( lim < 10 && bptr->next )	/* clone the busy list to our local array */
+	{
+		buffs[lim++] = bptr->next;
+		la = ctx->buffers + bptr->next;
+		bptr = la;
+	}
+	if ( lim >= 10 && bptr->next )
+	{
+		printf( "Snark: fatal internal error. Too many items on buffer list.\n" );
+		ctx->skipping |= SKIP_TO_SAVESET;/* toss the remainder of this saveset */
+		return;
+	}
+	if ( lim != ctx->num_busys )
+	{
+		printf( "Snark: fatal internal error. busy list count (%d) != num_busys (%d).\n",
+				lim, ctx->num_busys );
+		ctx->skipping |= SKIP_TO_SAVESET;/* toss the remainder of this saveset */
+		return;
+	}
+	if ( lim == 2 && !bptr->amt )	/* only two items, but second is a tm */
+		return;/* so, nothing to do */
+	for ( ii=0; ii < lim-1; ++ii )	 /* for each item in busy list */
+	{
+		bptr = ctx->buffers + buffs[ii];
+		for ( jj=ii+1; jj < lim; ++jj )	 /* check to see if there's a like numbered one that came later */
+		{
+			la = ctx->buffers + buffs[jj];
+			if ( la->amt && la->blknum == bptr->blknum )
+			{
+				if ( (ctx->vflag&VERB_FILE_RDLVL) )
+					printf( "Found duplicate block numbered %ld. Discarded original.\n", bptr->blknum );
+				buffs[ii] = buffs[jj];	/* Just place the duplicate in the original's location */
+				if ( lim-jj > 1 )	/* and shift what's left (if any) up one spot */
+					memmove( buffs+jj, buffs+jj+1, (lim-jj-1) * sizeof(int) );
+				--ii;			/* conteract the outer for loop's ++ */
+				--lim;			/* shrink the total by 1 */
+				--ctx->num_busys;		/* reduce busy count too */
+				if ( (ctx->vflag&VERB_QUEUE_LVL) )
+				{
+					printf( "Found duplicate block numbered %ld. Discarding buffer %ld\n",
+						bptr->blknum, (long)(bptr-ctx->buffers) );
+					ctx->busybuffs = buffs[0]; /* fixup the busy que so it'll display correctly */
+					for ( jj=0; jj < lim-1; ++jj )
+					{
+						la = ctx->buffers + buffs[jj];
+						la->next = buffs[jj+1];
+					}
+					la = ctx->buffers + buffs[jj];
+					la->next = 0;
+				}
+				free_buff( ctx, bptr );	/* toss the original buffer */
+				break;		/* look again from the beginning */
+			}
+		}
+	}
+	if ( (ctx->vflag&VERB_QUEUE_LVL) )
+	{
+		printf( "After checking for duplicates:\n Busy queue (%d): ", ctx->busybuffs );
+		for ( ii=0; ii < lim; ++ii )
+			printf( "%d ", buffs[ii] );
+		printf( "\n blknums: " );
+		for ( ii=0; ii < lim; ++ii )
+		{
+			bptr = ctx->buffers + buffs[ii];
+			printf( "%7ld ", bptr->blknum );
+		}
+		printf( "\n" );
+		dump_queues(ctx, 2 );
+	}
+	/* Now check the busy list for holes */
+	for ( ii=0; ii < lim-1; ++ii )
+	{
+		bptr = ctx->buffers + buffs[ii];
+		la = ctx->buffers + buffs[ii+1];
+		if ( la->blknum-bptr->blknum > 1 )
+		{
+			printf( "Snark: missing block(s) %ld..%ld [%d missing].\n",
+					bptr->blknum+1, la->blknum-1, (int)(la->blknum - bptr->blknum - 1) );
+			if ( !ctx->eflag && !ctx->xflag )
+			{
+				ctx->skipping |= SKIP_TO_FILE;
+				return;/* abort during listing */
+			}
+		}
+	}
+}
+
+/**
+ * Get a record from tape or disk.
+ *
+ * Will not advance beyond two consecutive tape marks.
+ *
+ * @return 0 for tape mark, >0 bytes read, <0 error.
+ */
+static int read_record( struct vmb_ctx *ctx, unsigned char *buff, int len )
+{
+	unsigned char freclen[4], iFreclen[4];
+	int sts, tmpLen, reclen, Ireclen;
+	int tmpRecCnt;
+
+	if ( (ctx->tape_marks&3) == 3 )
+	{
+		if ( (ctx->vflag & VERB_DEBUG_LVL) )
+			printf( "read_record: returns 0 cuz read 2 TMs in a row.\n" );
+		return 0;				/* reached EOT, can't advance */
+	}
+	ctx->tape_marks <<= 1;
+	if ( !ctx->iflag && !ctx->Iflag )
+	{
+		sts = read( ctx->fd, buff, len );		/* Read from the tape */
+		if ( sts <= 0 )				/* A 0 is a tape mark, a -x is an error */
+		{
+			ctx->tape_marks |= 1;
+		}
+		if ( (ctx->vflag & VERB_DEBUG_LVL) )
+			printf( "read_record: returns %d.\n", sts );
+		return sts;
+	}
+/*
+ * Format of our 'i' disk image of a tape is:
+ *     4 byte record length in bytes, little endian, followed by 'n' bytes of data.
+ * Format of simh 'I' disk image of a tape is the same except it also has the 4 byte count following the 'n' bytes of data. TM's excluded.
+ */
+	sts = read( ctx->fd, freclen, 4 );		/* Read the record length from disk */
+	if ( sts <= 0 )				/* A 0 is EOF. a -x is an error */
+	{
+		ctx->tape_marks |= 1;			/* pretend we got a tape mark */
+		if ( (ctx->vflag & VERB_DEBUG_LVL) )
+			printf( "read_record: returns %d due to error or EOF.\n", sts );
+		return sts;
+	}
+	reclen = getu32( ctx, freclen );			/* convert endianess as appropriate */
+	if ( !reclen )				/* A 0 length record is a fake tape mark */
+	{
+		ctx->tape_marks |= 1;			/* Reached a fake tape mark */
+		if ( (ctx->vflag & VERB_DEBUG_LVL) )
+			printf( "read_record: returns 0 cuz found fake TM.\n" );
+		return 0;
+	}
+	if ( reclen > len )
+	{
+		printf( "Snark: WARNING: Record of %d bytes too long for user %d buffer.\n", reclen, len );
+		sts = read( ctx->fd, buff, len );		/* give 'em what he wants */
+		lseek( ctx->fd, reclen-len, SEEK_CUR );	/* Skip remainder of record */
+		if ( (ctx->vflag & VERB_DEBUG_LVL) )
+			printf( "read_record: returns %d.\n", sts );
+		return sts;
+	}
+	if ( reclen < len )
+		len = reclen;				/* trim byte count to actual record length */
+	tmpRecCnt = 0;
+	tmpLen = 0;
+	while ( tmpLen < len )
+	{
+		sts = read(ctx->fd, buff+tmpLen, len-tmpLen);
+		if ( sts <= 0 )
+		{
+			ctx->tape_marks |= 1;			/* pretend we got a tape mark */
+			if ( (ctx->vflag & VERB_DEBUG_LVL) )
+				printf( "read_record: read(%d) returns %d due to error or EOF on attempt %d. tmpLen=%d\n", len-tmpLen, sts, tmpRecCnt, tmpLen );
+			return sts;
+		}
+		if ( (ctx->vflag & VERB_DEBUG_LVL) )
+			printf( "read_record: attempt %d, read(%d) returns %d.\n", tmpRecCnt, len-tmpLen, sts );
+		tmpLen += sts;
+		++tmpRecCnt;
+	}
+	if ( ctx->Iflag )
+	{
+		sts = read( ctx->fd, iFreclen, 4 );		/* Read the end of block record length from disk */
+		if ( sts <= 0 )				/* A 0 is EOF. a -x is an error */
+		{
+			if ( (ctx->vflag & VERB_DEBUG_LVL) )
+				printf( "read_record: returns %d due to error reading SIMH record length.\n", sts );
+			return sts;
+		}
+		Ireclen = getu32( ctx, iFreclen );			/* convert endianess as appropriate */
+		if ( Ireclen != reclen )				/* it better match the starting one */
+		{
+			printf( "Snark: read_record: SIMH format record count mismatch. Expected %d read %d\n",  reclen, Ireclen);
+			return -1;
+		}
+	}
+	sts = reclen;
+	if ( (ctx->vflag&VERB_DEBUG_U32) || ((ctx->vflag&VERB_BLOCK_LVL ) && !(ctx->vflag&VERB_DEBUG_LVL)) )
+		printf("read_record: block returned %d(0x%X)\n", sts, sts );
+	return sts;
+}
+
+static __attribute__((unused)) void skip_to_tm( struct vmb_ctx *ctx )
+{
+	while ( 1 )
+	{
+		if ( !read_record( ctx, (unsigned char *)ctx->label, sizeof( ctx->label ) ) )
+			break;
+	}
+}
+
+static __attribute__((unused)) void alloc_buffers( struct vmb_ctx *ctx, int nbuffs, int buffsize )
+{
+	int ii;
+	struct buff_ctl *bp;
+
+	buffsize += 16;				/* make this a little bigger than he asked for */
+	nbuffs = MAX_BUFFCOUNT;			/* always use a fixed number of buffers */
+	if ( nbuffs+1 > ctx->num_buffers )		/* need to malloc (more) buffers */
+	{
+		int jj, newsz;
+		ii = ctx->num_buffers;			/* old top */
+		ctx->num_buffers = nbuffs+1;			/* new top */
+		newsz = ctx->num_buffers*sizeof( struct buff_ctl );	/* figure out how much we will have */
+		ctx->buffers = (struct buff_ctl *)realloc( ctx->buffers, newsz );	/* get new memory */
+		if ( !ctx->buffers )
+		{
+			printf( "Snark: Failed to malloc %d bytes for buffer pointers.\n", newsz );
+			exit (1);
+		}
+		bp = ctx->buffers + ii;			/* point to start of new area */
+		jj = ii;
+		for ( ; ii < ctx->num_buffers-1; ++ii , ++bp )
+		{
+			bp->buffer = NULL;			/* start with this empty */
+			bp->next = ii+1;
+			bp->amt = 0;
+		}
+		bp->buffer = NULL;
+		bp->next = ctx->freebuffs;
+		bp->amt = 0;
+		ctx->freebuffs = jj;
+	}
+	bp = ctx->buffers+1;				/* now go through and make sure everybody has a buffptr */
+	for ( ii=1; ii < ctx->num_buffers; ++ii, ++bp )
+	{
+		if ( ctx->buffalloc < buffsize || !bp->buffer )
+		{
+			bp->buffer = (unsigned char *)realloc( bp->buffer, buffsize );
+			if ( !bp->buffer )
+			{
+				printf( "Snark: Failed to malloc %d bytes for block buffer # %d\n", 
+						buffsize, ii );
+				exit(1);
+			}
+		}
+	}
+	if ( ctx->buffalloc < buffsize )
+		ctx->buffalloc = buffsize;			/* bump this up if appropriate */
+}
 
 
 static int getRfmRatt(struct file_details *f, char *rcdFormat, int dstLen, char delim)
@@ -1176,3 +1639,624 @@ void process_file ( unsigned char *buffer, int rsize )
 {
 	process_file_ctx(&g_ctx, buffer, rsize);
 }
+
+static void vmb_ctx_reset(struct vmb_ctx *ctx)
+{
+	memset(ctx, 0, sizeof(*ctx));
+	ctx->cDelim = ';';
+}
+
+static void usage ( const char *progname, int details )
+{
+	printf( "Usage: %s -f <tape image> [-t|-x] [options]\n", progname );
+	if ( !details )
+		return;
+	printf( "Options:\n" );
+	printf( "  -t, --list          List contents\n" );
+	printf( "  -x, --extract       Extract files (not implemented in this refactor)\n" );
+	printf( "  -f, --file <path>   Tape image path\n" );
+	printf( "  -h, --help          This help\n" );
+}
+
+static int rdhead ( struct vmb_ctx *ctx )
+{
+	int marks=0, mstop, len, nfound, rptd=0, stm=0;
+	char name[80];
+
+	ctx->skipping = 0;
+	ctx->total_errors += ctx->saveSet_errors;
+	ctx->saveSet_errors = 0;
+	nfound = 1;
+	mstop = 3;				/* autostop when we get to 2 tm's */
+	last_block_number = 0;		/* start all blocks at 0 */
+	freeall(ctx);				/* free all the buffers */
+
+	while ( 1 )
+	{
+		marks <<= 1;
+		len = read_record( ctx, (unsigned char *)ctx->label, sizeof(ctx->label) );
+		if ( !len )
+		{
+			++marks;
+		}
+		if ( marks >= mstop )
+		{
+			if ( !len )
+				return -1;		/* found EOF */
+			return 1;			/* no HDR1-2 found, skip it */
+		}
+		if ( len < LABEL_SIZE )
+		{
+			if ( len < 0 )
+				printf( "Snark: rdhead(): read_record() returned %d. Skipping.\n", len );
+			else
+				printf( "Snark: rdhead(): bad label count of %d. Skipping.\n", len );
+			stm = 2;			/* skip to next saveset */
+			continue;
+		}
+		if ( ctx->label[0] != 'H' )
+		{
+			printf( "Snark: rdhead(): bad label type = '%c'\n", ctx->label[0] );
+			continue;
+		}
+		if ( !strncmp ( ctx->label, "HDR2", 4 ) )
+		{
+			++rptd;				/* count up how many times we've hit a HDR2 */
+			if ( rptd > 10 )
+			{
+				printf( "Snark: Too many HDR2 records. (%d)\n", rptd );
+				return -1;
+			}
+			if ( !ctx->skipSet || ctx->selset )
+			{
+				ctx->skipSet = 0;		/* turn this off */
+				ctx->selset = 0;		/* turn this off too */
+				if ( (ctx->vflag&VERB_LVL) || ctx->tflag )
+				{
+					memcpy(name, ctx->label+4, 14);
+					name[14] = 0;
+					printf ( "Saveset number %d: %s\n\n", ctx->setnr+1, name );
+				}
+				break;
+			}
+			stm = 1;			/* skip to next HDR1 */
+		}
+		else if ( !strncmp ( ctx->label, "HDR1", 4 ) )
+		{
+			++ctx->setnr;
+			marks = 0;			/* reset the mark counter */
+			if ( ctx->selset )
+			{
+				if ( !strncmp( ctx->selsetname, ctx->label+4, 14 ) )
+					ctx->selset = 0;
+				else
+				{
+					if ( (ctx->vflag&VERB_LVL) || ctx->tflag )
+						printf( "Saveset %s does not match selected saveset %s. Skipping.\n",
+								ctx->label+4, ctx->selsetname );
+					continue;
+				}
+			}
+			if ( stm == 1 )
+			{
+				if ( ctx->skipSet && ctx->setnr < ctx->skipSet )
+				{
+					if ( (ctx->vflag&VERB_LVL) || ctx->tflag )
+						printf( "Skipping saveset %d because it's before -s flag of %d.\n", ctx->setnr, ctx->skipSet );
+					continue;
+				}
+				stm = 0;
+			}
+			if ( stm == 2 )
+				continue;
+			++ctx->numHdrs;
+			if ( ctx->skipSet )
+			{
+				if ( ctx->numHdrs < ctx->skipSet )
+				{
+					if ( (ctx->vflag&VERB_LVL) || ctx->tflag )
+						printf( "Number of HDRs of %d is less than -S flag of %d. Skipping.\n", ctx->numHdrs, ctx->skipSet );
+					stm = 2;			/* skip to next volume or HDR marker */
+					continue;
+				}
+				if ( ctx->numHdrs > ctx->skipSet )
+				{
+					if ( (ctx->vflag&VERB_LVL) || ctx->tflag )
+						printf( "Number of HDRs %d is more than -S flag of %d. Done.\n", ctx->numHdrs, ctx->skipSet );
+					nfound = -1;
+					break;
+				}
+			}
+			nfound = 0;
+			mstop = 1;
+			continue;
+		}
+	}
+	if ( rptd > 1 )
+		printf( "Snark: rdhead(): Skipped %d bad records looking for a HDR2.\n", rptd );
+	if ( !ctx->tflag && (ctx->vflag & VERB_LVL) && !nfound )
+		printf ( "Saveset name: %s   number: %d\n", name, ctx->setnr );
+	if ( !nfound && ctx->blocksize && ctx->blocksize+16 > ctx->buffalloc )
+	{
+		alloc_buffers( ctx, MAX_BUFFCOUNT, ctx->blocksize );
+		freeall(ctx);
+	}
+	return( nfound );
+}
+
+static int read_next_block( struct vmb_ctx *ctx )
+{
+	unsigned long numb0;
+	struct buff_ctl *bptr;
+	int ra, hittm=0;
+
+	if ( !ctx->busybuffs )		/* if first time through, need to rdhead() then fill n buffers */
+	{
+		if ( rdhead ( ctx ) )	/* read header */
+			return NXT_BLK_EOT;	/* reached eot */
+		bptr = getfree_buff(ctx);
+		if ( !bptr )
+		{
+			printf( "Snark: Fatal internal error. No more free buffs.\n" );
+			ctx->skipping |= SKIP_TO_SAVESET;
+			return NXT_BLK_ERR;
+		}
+		while ( 1 )
+		{
+			bptr->amt = read_record( ctx, bptr->buffer, ctx->buffalloc );	/* fill first buffer */
+			if ( !bptr->amt )
+			{
+				free_buff(ctx, bptr );				/* put this back */
+				return NXT_BLK_TM;				/* found tm */
+			}
+			if ( bptr->amt == ctx->blocksize )           /* block is ok so far */
+			{
+				numb0 = get_block_number( ctx, bptr->buffer );	/* get the block number of leading block */
+				if ( !numb0 )
+					continue;					/* not a valid block, skip it */
+				if ( numb0 != 1 )				/* it had better be a 1 */
+				{
+					free_buff(ctx, bptr );				/* put this back */
+					return NXT_BLK_NOLEAD;			/* no leading block */
+				}
+				break;
+			}
+			printf ( "Snark: record size incorrect. read amt = %d, expected %d\n", bptr->amt, ctx->blocksize );
+		}
+		bptr->blknum = 1;					/* always starts with block 1 */
+		add_busybuff( ctx, bptr, 0 );				/* put this on the busy queue */
+	}
+	bptr = ctx->buffers+ctx->busybuffs;		/* point to top item on queue */
+	if ( !bptr->amt )			/* if top buffer is a TM */
+	{
+		free_buff(ctx, popbusy_buff(ctx) );	/* toss the top item */
+		return NXT_BLK_TM;		/* return eof */
+	}
+	while ( bptr->next )		/* find last item on busy queue */
+		bptr = ctx->buffers + bptr->next;
+	if ( !bptr->amt )			/* if last item is a tm, nothing left to read */
+		return NXT_BLK_OK;		/* just consume whatever is currently on the queue */
+	while ( !hittm && ctx->num_busys < MAX_BUFFCOUNT )	/* keep busy queue as full as possible */
+	{
+		for ( ra=ctx->num_busys; !hittm && ra < MAX_BUFFCOUNT; ++ra )	/* may need to readahead n buffers */
+		{
+			bptr = getfree_buff(ctx);		/* get a free buffer */
+			if ( !bptr )
+			{
+				printf( "Snark: Fatal internal error. Ran out of free buffs.\n" );
+				ctx->skipping |= SKIP_TO_SAVESET;
+				return NXT_BLK_ERR;
+			}
+			while ( !hittm )
+			{
+				bptr->amt = read_record( ctx, bptr->buffer, ctx->buffalloc );	/* fill it up */
+				if ( !bptr->amt )		/* reached TM on readahead */
+				{
+					hittm = 1;			/* can't read anymore */
+					break;
+				}
+				if ( bptr->amt == ctx->blocksize )
+				{
+					bptr->blknum = get_block_number( ctx, bptr->buffer );	/* get the block number */
+					if ( !bptr->blknum )	/* not a valid block */
+						continue;		/* get another one */
+					break;			/* block is ok so far */
+				}
+				printf ( "Snark: record size on readahead is incorrect. read amt = %d, expected %d\n",
+						 bptr->amt, ctx->blocksize );
+			}
+			if ( !hittm )
+				add_busybuff( ctx, bptr, 0 );	/* append the buffer to busy queue */
+			else
+				free_buff(ctx, bptr );		/* toss this for now */
+		}
+		remove_dups(ctx);				/* account for missing & duplicates in busy queue */
+	}
+	if ( hittm )			/* if we've hit a TM */
+	{
+		bptr = getfree_buff(ctx);
+		add_busybuff( ctx, bptr, 0 );	/* stick a TM at end of busy queue */
+	}
+	return NXT_BLK_OK;			/* we've got a good record */
+}
+
+static unsigned long get_block_number( struct vmb_ctx *ctx, unsigned char *bptr )
+{
+	unsigned long ans = 0, bsize;
+	struct bbh *block_header;
+	unsigned short bhsize;
+
+	block_header = ( struct bbh * )bptr;
+
+	bhsize = GETU16( ctx, block_header->bbh_dol_w_size );
+	bsize = getu32(ctx, (unsigned char *)&block_header->bbh_dol_l_blocksize );
+
+	if ( bhsize != sizeof ( struct bbh ) )
+	{
+		printf ( "Snark: Invalid header block size. Expected %zu, found %lu\n",
+				sizeof( struct bbh ), (unsigned long)bhsize );
+		return ans;
+	}
+	if ( bsize != 0 && bsize != (unsigned long)ctx->blocksize )
+	{
+		printf ( "Snark: Invalid block size. Expected %d, found %ld\n", ctx->blocksize, bsize );
+		return ans;
+	}
+	return getu32(ctx, (unsigned char *)&block_header->bbh_dol_l_number );
+}
+
+static void process_block ( struct vmb_ctx *ctx, unsigned char *blkptr )
+{
+	void process_vbn ( unsigned char *buffer, int rsize );
+	void process_summary( unsigned char *blkptr, int rsize );
+
+	unsigned short rsize, rtype, applic;
+	unsigned long bsize, ii, numb;
+	struct bbh *block_header;
+
+	ctx->skipping &= ~SKIP_TO_BLOCK;
+
+	/* read the backup block header */
+	block_header = ( struct bbh * )blkptr;
+	ii = sizeof( struct bbh );
+
+	bsize = getu32(ctx, (unsigned char *)&block_header->bbh_dol_l_blocksize );
+
+	numb = get_block_number( ctx, blkptr );
+	if ( !numb )
+	{
+		ctx->skipping |= SKIP_TO_BLOCK;
+		++ctx->saveSet_errors;
+		++ctx->file.file_blk_error;
+		return;
+	}
+	if ( numb != last_block_number+1 )
+	{
+		if ( numb == last_block_number )
+			printf( "Snark: block %ld duplicated.\n", numb );
+		else
+			printf( "Snark: block %ld out of sequence. Expected %ld\n",
+					numb, last_block_number+1 );
+	}
+	last_block_number = numb;
+	applic = GETU16( ctx, block_header->bbh_dol_w_applic );
+	if ( (ctx->vflag & VERB_DEBUG_LVL) )
+	{
+		printf ( "new block: ii = %ld, bsize = %ld, opsys=%d, subsys=%d, applic=%d, number=%ld\n",
+				 ii, bsize,
+				 GETU16( ctx, block_header->bbh_dol_w_opsys ),
+				 GETU16( ctx, block_header->bbh_dol_w_subsys ),
+				 applic,
+				 numb );
+	}
+	if ( !bsize || applic > 1 )
+	{
+		if ( (ctx->vflag & VERB_DEBUG_LVL) )
+		{
+			if ( !bsize )
+				printf( "Process_block(): Skipped block because bsize == 0\n" );
+			else
+				printf( "Process_block(): Skipped block because applic field is %d instead of 1.\n",
+						applic );
+		}
+		ctx->skipping |= SKIP_TO_BLOCK;
+		return;
+	}
+	/* read the records */
+	while ( ii < bsize )
+	{
+		struct brh *record_header;
+		/* read the backup record header */
+		record_header = ( struct brh * ) (blkptr+ii);
+		ii += sizeof ( struct brh );
+
+		rtype = GETU16( ctx, record_header->brh_dol_w_rtype );
+		rsize = GETU16( ctx, record_header->brh_dol_w_rsize );
+		if ( (ctx->vflag & VERB_DEBUG_LVL) )
+		{
+			printf ( "ii=%ld, rtype=%d, rsize=%d, flags=0x%lX, addr=0x%lX\n",
+					 ii, rtype, rsize,
+					 getu32(ctx, (unsigned char *)&record_header->brh_dol_l_flags ),
+					 getu32(ctx, (unsigned char *)&record_header->brh_dol_l_address ) );
+		}
+		if ( rsize+ii > bsize )	/* This is an invalid record */
+		{
+			printf( "Snark: rsize of %d is wrong. Cannot be more than %ld\n",
+					rsize, bsize-ii );
+			ctx->skipping |= SKIP_TO_BLOCK;
+			++ctx->saveSet_errors;
+			++ctx->file.file_record_error;
+			break;
+		}
+		switch ( rtype )
+		{
+		
+		case brh_dol_k_null:
+			if ( (ctx->vflag & VERB_DEBUG_LVL) )
+				printf ( "rtype = null\n" );
+			break;
+
+		case brh_dol_k_summary:
+			if ( (ctx->vflag & VERB_DEBUG_LVL) )
+				printf ( "rtype = summary\n" );
+			process_summary( blkptr+ii, rsize );
+			break;
+
+		case brh_dol_k_file:
+			if ( (ctx->vflag & VERB_DEBUG_LVL) )
+				printf ( "rtype = file\n" );
+			process_file ( blkptr+ii, rsize );
+			break;
+
+		case brh_dol_k_vbn:
+			if ( (ctx->vflag & VERB_DEBUG_LVL) )
+				printf ( "rtype = vbn\n" );
+			if ( !(ctx->skipping&SKIP_TO_FILE) )
+				process_vbn ( blkptr+ii, rsize );
+			break;
+
+		case brh_dol_k_physvol:
+			if ( (ctx->vflag & VERB_DEBUG_LVL) )
+				printf ( "rtype = physvol\n" );
+			break;
+
+		case brh_dol_k_lbn:
+			if ( (ctx->vflag & VERB_DEBUG_LVL) )
+				printf ( "rtype = lbn\n" );
+			break;
+
+		case brh_dol_k_fid:
+			if ( (ctx->vflag & VERB_DEBUG_LVL) )
+				printf ( "rtype = fid\n" );
+			break;
+
+		default:
+			printf ( "Snark: process_block(): %d is an invalid record type.\n", rtype );
+			++ctx->saveSet_errors;
+			if ( ctx->file.extf )
+			{
+				printf( "Snark: Skipping rest of %s\n", ctx->file.name );
+				++ctx->file.file_record_error;
+			}
+			ctx->skipping |= SKIP_TO_BLOCK|SKIP_TO_FILE;
+			return;
+		}
+		ii += rsize;
+	}
+}
+
+static int vmsbackup_entry(struct vmb_ctx *ctx, int argc, char *argv[])
+{
+	const char *progname = argv[0];
+	int c;
+	int option_index = 0;
+	char *endp;
+	struct stat fileStat;
+
+	if ( argc < 2 )
+	{
+		usage( progname, 1 );
+		return 1;
+	}
+
+	vmb_ctx_reset(ctx);
+
+	while ( ( c = getopt_long ( argc, argv, "cdeEF:f:hiIln:Rs:tv:wx", long_options, &option_index ) ) != -1 )
+	{
+		switch ( c )
+		{
+		case OPT_VER_DELIMIT:	/* --delimiter */
+			if ( !optarg )
+			{
+				printf("Defaulting version delimiter to ':'\n");
+				ctx->cDelim = ':';
+				break;
+			}
+			if ( !isprint((unsigned char)optarg[0]) )
+			{
+				printf("Argument to --delimiter must be printable. Is 0x%02X\n", (unsigned char)optarg[0]);
+				return 1;
+			}
+			ctx->cDelim = optarg[0];
+			break;
+		case OPT_EXTRACT:		/* --extract */
+			endp = NULL;
+			ctx->eflag = strtoul(optarg,&endp,0);
+			if ( !endp || *endp || ctx->eflag < 0 || ctx->eflag > 2)
+			{
+				printf("Snark: Bad --extract parameter: '%s'. Must be a number 0 <= n <= 2\n", optarg);
+				return 1;
+			}
+			++ctx->xflag;
+			break;
+		case 'c':
+			ctx->cDelim = ':';
+			break;
+		case OPT_HIERARCHY:		/* -d */
+		case 'd':
+			++ctx->dflag;
+			break;
+		case 'e':
+			ctx->eflag = 1;
+			break;
+		case 'E':
+			ctx->eflag = 2;
+			break;
+		case OPT_FILE:			/* -f */
+		case 'f':
+			ctx->tapefile = optarg;
+			break;
+		case 'F':
+			endp = NULL;
+			ctx->vfcflag = strtoul(optarg,&endp,0);
+			if ( !endp || *endp || ctx->vfcflag < 0 || ctx->vfcflag > 2)
+			{
+				printf("Snark: Bad -F parameter: '%s'. Must be a number 0 <= F <= 2\n", optarg);
+				return 1;
+			}
+			break;
+		case OPT_HELP:			/* -h */
+		default:
+			printf( "Unrecognised option: '%c'.\n", c );
+		case 'h':
+		case '?':
+			usage ( progname, 1 );
+			return 0;
+		case OPT_DVD:			/* -i */
+		case 'i':
+			++ctx->iflag;
+			break;
+		case OPT_SIMH:			/* -I */
+		case 'I':
+			++ctx->Iflag;
+			break;
+		case OPT_BINARY:
+			++ctx->binaryFlag;
+			break;
+		case OPT_LOWERCASE:		/* -l */
+		case 'l':
+			++ctx->lcflag;
+			break;
+		case OPT_SET_NAME:		/* -n */
+		case 'n':
+			++ctx->nflag;
+			break;
+		case OPT_NO_VERSION:		/* -R */
+		case 'R':
+			++ctx->Rflag;
+			break;
+		case OPT_HDR1_NUMBER:	/* -s */
+		case 's':
+			ctx->skipSet = strtol(optarg,&endp,0);
+			if ( !endp || *endp || ctx->skipSet <= 0 )
+			{
+				printf("Snark: Bad -s parameter. '%s' Must be integer greater than 1\n", optarg);
+				return 1;
+			}
+			break;
+		case OPT_LIST:			/* -t */
+		case 't':
+			++ctx->tflag;
+			break;
+		case OPT_VERBOSE:		/* -v */
+		case 'v':
+			endp = NULL;
+			ctx->vflag = strtoul(optarg,&endp,0);
+			if ( !endp || *endp )
+			{
+				printf("Snark: Bad -v parameter: '%s'. Must be a number\n", optarg);
+				return 1;
+			}
+			break;
+		case OPT_PROMPT:			/* -w */
+		case 'w':
+			++ctx->wflag;
+			break;
+		case 'x':
+			++ctx->xflag;
+			break;
+		}
+	}
+
+	if ( !ctx->tapefile )
+	{
+		printf("The -f (or --file) option is required.\n");
+		return 1;
+	}
+	if ( !ctx->tflag && !ctx->xflag )
+	{
+		printf( "You must provide either -x or -t.\n" );
+		usage ( progname, 1 );
+		return 1;
+	}
+
+	if ( !ctx->tapefile )
+	{
+		printf("The -f (or --file) option is required.\n");
+		return 1;
+	}
+	if ( !ctx->tflag && !ctx->xflag )
+	{
+		printf( "You must provide either -x or -t.\n" );
+		usage ( progname, 1 );
+		return 1;
+	}
+
+	ctx->gargv = argv;
+	ctx->gargc = argc;
+	ctx->goptind = optind;
+
+	ctx->fd = stat( ctx->tapefile, &fileStat);
+	if ( ctx->fd < 0 )
+	{
+		perror("Failed to stat file");
+		return 1;
+	}
+	ctx->fd = open(ctx->tapefile, OPEN_FLAGS);
+	if ( ctx->fd < 0 )
+	{
+		perror ( ctx->tapefile );
+		return 1;
+	}
+
+	printf("vmsbackup_entry(): core pipeline not yet reimplemented; options parsed and file opened.\n");
+	printf("vmsbackup_entry(): core pipeline not yet reimplemented; options parsed.\n");
+	return 1;
+}
+
+int vmsbackup_main ( int argc, char *argv[] )
+{
+	return vmb_ctx_run(&g_ctx, argc, argv);
+}
+
+vmb_ctx *vmb_ctx_create(void)
+{
+	vmb_ctx *ctx = (vmb_ctx *)malloc(sizeof(vmb_ctx));
+	if (ctx)
+	{
+		vmb_ctx_reset(ctx);
+	}
+	return ctx;
+}
+
+void vmb_ctx_destroy(vmb_ctx *ctx)
+{
+	if (ctx)
+	{
+		free(ctx);
+	}
+}
+
+int vmb_ctx_run(vmb_ctx *ctx, int argc, char *argv[])
+{
+	if (!ctx)
+		return -1;
+	return vmsbackup_entry(ctx, argc, argv);
+}
+
+#ifndef VMSBACKUP_NO_MAIN
+int main ( int argc, char *argv[] )
+{
+	return vmsbackup_main(argc, argv);
+}
+#endif
