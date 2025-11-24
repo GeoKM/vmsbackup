@@ -4,7 +4,10 @@
 #include <ctype.h>
 #include <stdlib.h>
 #include <fcntl.h>
+
+#if HAVE_MTIO
 #include <sys/mtio.h>
+#endif
 
 /* Program used to copy the images from tape to disk. */
 
@@ -19,6 +22,7 @@
  * Two tape marks in a row indicates an end of tape condition.
  */
 
+#if HAVE_MTIO
 static char buff[128*1024];
 
 int main( int argc, char *argv[] )
@@ -125,3 +129,10 @@ int main( int argc, char *argv[] )
     printf( "Read a total of %ld bytes\n", total );
     return 0;
 }
+#else
+int main(void)
+{
+    fprintf(stderr, "cp_tape was built without mtio support on this platform.\n");
+    return 1;
+}
+#endif

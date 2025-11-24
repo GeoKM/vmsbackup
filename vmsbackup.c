@@ -1880,6 +1880,28 @@ static int read_next_block( struct vmb_ctx *ctx )
 	return NXT_BLK_OK;			/* we've got a good record */
 }
 
+static void rdtail ( void )
+{
+	int len;
+
+	close_file_ctx(&g_ctx);
+	/* read the tape label - 4 records of 80 bytes */
+	while ( ( len = read_record( &g_ctx, (unsigned char *)g_ctx.label, sizeof(g_ctx.label) ) ) != 0 )
+	{
+		if ( len != LABEL_SIZE )
+		{
+			printf ( "Snark: rdtail(): bad EOF label record. Expected %d bytes got %d.\n", LABEL_SIZE, len );
+			g_ctx.skipping |= SKIP_TO_SAVESET;
+			/* end_of_saveset( NULL ); TODO: restore when callback exists */
+			break;
+		}
+		if ( strncmp ( g_ctx.label, "EOF1", 4 ) == 0 )
+		{
+			/* end_of_saveset( label ); TODO: restore when callback exists */
+		}
+	}
+}
+
 static unsigned long get_block_number( struct vmb_ctx *ctx, unsigned char *bptr )
 {
 	unsigned long ans = 0, bsize;
@@ -1905,11 +1927,10 @@ static unsigned long get_block_number( struct vmb_ctx *ctx, unsigned char *bptr 
 	return getu32(ctx, (unsigned char *)&block_header->bbh_dol_l_number );
 }
 
+static void process_summary_ctx( struct vmb_ctx *ctx, unsigned char *blkptr, int rsize );
+static void process_vbn_ctx ( struct vmb_ctx *ctx, unsigned char *buffer, int rsize );
 static void process_block ( struct vmb_ctx *ctx, unsigned char *blkptr )
 {
-	void process_vbn ( unsigned char *buffer, int rsize );
-	void process_summary( unsigned char *blkptr, int rsize );
-
 	unsigned short rsize, rtype, applic;
 	unsigned long bsize, ii, numb;
 	struct bbh *block_header;
@@ -1999,7 +2020,7 @@ static void process_block ( struct vmb_ctx *ctx, unsigned char *blkptr )
 		case brh_dol_k_summary:
 			if ( (ctx->vflag & VERB_DEBUG_LVL) )
 				printf ( "rtype = summary\n" );
-			process_summary( blkptr+ii, rsize );
+			process_summary_ctx( ctx, blkptr+ii, rsize );
 			break;
 
 		case brh_dol_k_file:
@@ -2012,7 +2033,7 @@ static void process_block ( struct vmb_ctx *ctx, unsigned char *blkptr )
 			if ( (ctx->vflag & VERB_DEBUG_LVL) )
 				printf ( "rtype = vbn\n" );
 			if ( !(ctx->skipping&SKIP_TO_FILE) )
-				process_vbn ( blkptr+ii, rsize );
+				process_vbn_ctx( ctx, blkptr+ii, rsize );
 			break;
 
 		case brh_dol_k_physvol:
@@ -2045,6 +2066,194 @@ static void process_block ( struct vmb_ctx *ctx, unsigned char *blkptr )
 	}
 }
 
+static void process_summary_ctx( struct vmb_ctx *ctx, unsigned char *blkptr, int rsize )
+{
+	int ii, cc;
+	short ssr_type;
+
+	cc = 0;
+	++ctx->numHdrs;
+	for ( ii=0; ii < 3 && cc < rsize; ++ii )
+	{
+		ssr_type = getu16(ctx, (unsigned char *)blkptr+cc);
+		cc += 2;
+		switch ( (int)ssr_type )
+		{
+		case SUMM_END:
+			return;
+		case SUMM_SSNAME:
+			if ( (ctx->vflag & VERB_DEBUG_LVL) )
+				printf( "SUMMARY: Saveset name: %.14s\n", blkptr+cc+1 );
+			break;
+		case SUMM_CMDLINE:
+			if ( (ctx->vflag & VERB_DEBUG_LVL) )
+				printf( "SUMMARY: Command line: %s\n", blkptr+cc+1 );
+			break;
+		case SUMM_COMMENT:
+			if ( (ctx->vflag & VERB_DEBUG_LVL) )
+				printf( "SUMMARY: Comment: %s\n", blkptr+cc+1 );
+			break;
+		case SUMM_USER:
+			if ( (ctx->vflag & VERB_DEBUG_LVL) )
+				printf( "SUMMARY: Username: %s\n", blkptr+cc+1 );
+			break;
+		case SUMM_UID:
+			if ( (ctx->vflag & VERB_DEBUG_LVL) )
+			{
+				int uid, gid;
+				uid = ((blkptr[cc+3]&0xFF)<<8) | (blkptr[cc+2]&0xFF);
+				gid = ((blkptr[cc+5]&0xFF)<<8) | (blkptr[cc+4]&0xFF);
+				printf( "SUMMARY: UID: %06o,%06o\n", gid, uid );
+			}
+			break;
+		case SUMM_CTIME:
+			if ( (ctx->vflag & VERB_DEBUG_LVL) )
+				printf( "SUMMARY: Creation time: %s\n", vms2unixtime( vms2unixsecs( ctx, (unsigned char *)blkptr+cc ) ) );
+			break;
+		case SUMM_OSCODE:
+			if ( (ctx->vflag & VERB_DEBUG_LVL) )
+			{
+				unsigned short oscode;
+				oscode = getu16(ctx, (unsigned char *)blkptr+cc);
+				printf( "SUMMARY: OS Code: 0x%02X (%s)\n", oscode,
+						oscode == SUMM_OSCODE_VAX ? "VAX" : oscode == SUMM_OSCODE_AXP ? "Alpha" : "Unknown" );
+			}
+			break;
+		case SUMM_OSVERSION:
+			if ( (ctx->vflag & VERB_DEBUG_LVL) )
+			{
+				unsigned short osver;
+				osver = getu16(ctx, (unsigned char *)blkptr+cc);
+				printf( "SUMMARY: OS Version: 0x%02X\n", osver );
+			}
+			break;
+		case SUMM_NODENAME:
+			if ( (ctx->vflag & VERB_DEBUG_LVL) )
+				printf( "SUMMARY: Node name: %s\n", blkptr+cc+1 );
+			break;
+		case SUMM_PID:
+			if ( (ctx->vflag & VERB_DEBUG_LVL) )
+			{
+				unsigned short pid;
+				pid = getu16(ctx, (unsigned char *)blkptr+cc);
+				printf( "SUMMARY: PID: 0x%02X\n", pid );
+			}
+			break;
+		case SUMM_DEVICE:
+			if ( (ctx->vflag & VERB_DEBUG_LVL) )
+				printf( "SUMMARY: Device: %s\n", blkptr+cc+1 );
+			break;
+		case SUMM_BCKVERSION:
+			if ( (ctx->vflag & VERB_DEBUG_LVL) )
+				printf( "SUMMARY: BACKUP version: %s\n", blkptr+cc+1 );
+			break;
+		case SUMM_BLOCKSIZE:
+			ctx->blocksize = getu32(ctx, (unsigned char *)blkptr+cc);
+			if ( (ctx->vflag & VERB_DEBUG_LVL) )
+				printf( "SUMMARY: /BLOCKSIZE: %d\n", ctx->blocksize );
+			break;
+		case SUMM_GROUPSIZE:
+			if ( (ctx->vflag & VERB_DEBUG_LVL) )
+			{
+				int grpsize;
+				grpsize = getu32(ctx, (unsigned char *)blkptr+cc);
+				printf( "SUMMARY: /GROUP: %d\n", grpsize );
+			}
+			break;
+		case SUMM_BUFFCOUNT:
+			if ( (ctx->vflag & VERB_DEBUG_LVL) )
+			{
+				int buffcnt;
+				buffcnt = getu32(ctx, (unsigned char *)blkptr+cc);
+				printf( "SUMMARY: /BUFFER: %d\n", buffcnt );
+			}
+			break;
+		default:
+			if ( (ctx->vflag & VERB_DEBUG_LVL) )
+				printf( "SUMMARY: Unknown summary record type 0x%X\n", ssr_type );
+			break;
+		}
+		cc += blkptr[cc];
+	}
+}
+
+void process_summary( unsigned char *blkptr, int rsize )
+{
+	process_summary_ctx(&g_ctx, blkptr, rsize);
+}
+
+static void process_vbn_ctx ( struct vmb_ctx *ctx, unsigned char *buffer, int rsize )
+{
+	int ii, jj, kk;
+	unsigned long firstvbn;
+	unsigned int nblocks;
+	unsigned short rsize2;
+	unsigned char *rptr;
+
+	rptr = buffer;
+	rsize2 = rsize;
+	for ( ii=0; ii < 2; ++ii )
+	{
+		firstvbn = getu32(ctx, rptr );	/* get starting vbn */
+		rptr += 4;
+		rsize2 -= 4;
+		nblocks = getu16(ctx, rptr );	/* number of physical blocks in file */
+		rptr += 2;
+		rsize2 -= 2;
+		if ( (ctx->vflag & VERB_DEBUG_LVL) )
+			printf( "  file vbn: %ld, nblocks: %d\n", firstvbn, nblocks );
+		if ( ii )
+		{
+			/* second entry is the physical pointer to the first virtual block */
+			if ( firstvbn == 0 )
+				printf( "Snark: Invalid physical block number pointer (0).\n" );
+			continue;
+		}
+		for ( jj=0; jj < 4 && rsize2; ++jj )
+		{
+			unsigned int blksiz;
+			blksiz = getu16(ctx, rptr );
+			if ( blksiz != (unsigned int)ctx->blocksize )
+				printf( "Snark: bogus block size (%u). Expected %d.\n", blksiz, ctx->blocksize );
+			rptr += 2;
+			rsize2 -= 2;
+		}
+		if ( jj < 4 )
+		{
+			printf( "Snark: Invalid number of blocks found in this file: %d. bsize = %d\n",
+					jj, ctx->blocksize );
+			break;
+		}
+		for ( jj=0; jj < (int)nblocks; ++jj )
+		{
+			unsigned long fvbn;
+			if ( rsize2 < 4 )
+			{
+				printf( "Snark: process_vbn(): bogus physical VBN count for '%s', jj=%d, nblocks=%d\n",
+						g_ctx.file.name, jj, nblocks );
+				return;
+			}
+			fvbn = getu32(ctx, rptr );
+			rptr += 4;
+			rsize2 -= 4;
+			if ( ctx->tflag || (ctx->vflag & VERB_DEBUG_LVL) )
+				printf( "  virtual block %d starts at physical vbn %ld, %d in file\n",
+						jj, fvbn, jj*ctx->blocksize );
+			if ( !ctx->tflag && ctx->vflag )
+			{
+				for ( kk=0; kk < 8; ++kk )
+					printf( " %02X", rptr[kk] );
+				printf( "\n" );
+			}
+		}
+	}
+}
+
+void process_vbn ( unsigned char *buffer, int rsize )
+{
+	process_vbn_ctx(&g_ctx, buffer, rsize);
+}
+
 static int vmsbackup_entry(struct vmb_ctx *ctx, int argc, char *argv[])
 {
 	const char *progname = argv[0];
@@ -2052,6 +2261,7 @@ static int vmsbackup_entry(struct vmb_ctx *ctx, int argc, char *argv[])
 	int option_index = 0;
 	char *endp;
 	struct stat fileStat;
+	int eoffl = 0;
 
 	if ( argc < 2 )
 	{
@@ -2219,9 +2429,69 @@ static int vmsbackup_entry(struct vmb_ctx *ctx, int argc, char *argv[])
 		return 1;
 	}
 
-	printf("vmsbackup_entry(): core pipeline not yet reimplemented; options parsed and file opened.\n");
-	printf("vmsbackup_entry(): core pipeline not yet reimplemented; options parsed.\n");
-	return 1;
+	alloc_buffers( ctx, MAX_BUFFCOUNT, ctx->blocksize ? ctx->blocksize : 65536 );
+	freeall(ctx);
+
+	/* read the backup tape blocks until end of tape */
+	while ( !eoffl )
+	{
+		struct buff_ctl *bptr = NULL;
+		eoffl = read_next_block(ctx);
+		switch ( eoffl )
+		{
+		case NXT_BLK_EOT:		/* reached EOT */
+			eoffl = 1;		/* we're done */
+			continue;
+		case NXT_BLK_TM:		/* reached a TM */
+			rdtail (  );		/* read EOF labels */
+			freeall(ctx);		/* reset for next saveset */
+			ctx->skipping = 0;		/* not skipping anything now */
+			eoffl = 0;
+			continue;		/* loop */
+		default:
+			printf( "Snark: Undefined return value from read_next_block(): %d\n", eoffl );
+			/* FALL THROUGH TO NXT_BLK_NOLEAD */
+		case NXT_BLK_ERR:		/* Generic internal error */
+		case NXT_BLK_NOLEAD:	/* Failed to read leading block */
+			++ctx->saveSet_errors;
+			ctx->skipping |= SKIP_TO_SAVESET;
+			skip_to_tm(ctx);
+			freeall(ctx);		/* reset for next saveset */
+			eoffl = 0;
+			continue;
+		case NXT_BLK_OK:
+			{
+				bptr = popbusy_buff(ctx);
+				if ( bptr && bptr->blknum != last_block_number+1 )
+				{
+					printf( "Snark: block %ld out of sequence. Expected %ld\n",
+							bptr ? bptr->blknum : 0, last_block_number+1 );
+					++ctx->file.file_blk_error;
+					++ctx->saveSet_errors;
+					close_file_ctx(ctx);
+					ctx->skipping |= SKIP_TO_FILE;	/* current file is probably corrupt */
+				}
+				eoffl = 0;
+				break;
+			}
+		}
+		if ( bptr )
+		{
+			process_block ( ctx, bptr->buffer );
+			free_buff(ctx, bptr );
+		}
+	}
+	close_file_ctx(ctx);
+
+	if ( ctx->vflag || ctx->tflag )
+		printf ( "End of tape\n" );
+
+	close ( ctx->fd );
+	if ( ctx->total_errors )
+		printf( "Snark: A total of %d error%s detected.\n",
+				ctx->total_errors, ctx->total_errors > 1 ? "s" : "" );
+
+	return ctx->total_errors ? 1 : 0;
 }
 
 int vmsbackup_main ( int argc, char *argv[] )

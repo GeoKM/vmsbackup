@@ -17,6 +17,9 @@
 #include	<time.h>
 #include	<utime.h>
 #include	<stdint.h>
+#ifndef O_LARGEFILE
+#define O_LARGEFILE 0
+#endif
 
 /* File to unpack a .TAP file to raw binary'
  *
