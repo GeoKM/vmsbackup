@@ -1,11 +1,10 @@
 #pragma once
 
 #include <QMainWindow>
-#include <QLabel>
-#include <QPushButton>
 #include <QPlainTextEdit>
-#include <QComboBox>
 #include <QProgressBar>
+
+class BackendRunner;
 
 class MainWindow : public QMainWindow
 {
@@ -22,13 +21,11 @@ private slots:
 
 private:
     void buildUi();
+    void setBusy(bool busy);
 
     QString imagePath_;
-    QLabel *imageLabel_;
-    QPushButton *openButton_;
-    QPushButton *listButton_;
-    QPushButton *extractButton_;
-    QComboBox *modeCombo_;
+    QWidget *controls_;
     QProgressBar *progress_;
     QPlainTextEdit *log_;
+    BackendRunner *runner_;
 };

@@ -293,7 +293,7 @@ static int write_ss( FILE *inp )
     }
     if ( ferror(inp) )
     {
-        printf( "Error: Error reading input. Expected %d bytes, got %d. Err=%s",
+        printf( "Error: Error reading input. Expected %zu bytes, got %d. Err=%s",
             sizeof(bc), retv, strerror(errno) );
         return -1;
     }
@@ -337,7 +337,7 @@ static int write_ss( FILE *inp )
         outv = fwrite( &bc, 1, sizeof(bc), outp );
         if ( outv != (int)sizeof(bc) )
         {
-            printf( "Error: Error writing %d byte end of media header. Wrote %d. Err=%s\n",
+            printf( "Error: Error writing %zu byte end of media header. Wrote %d. Err=%s\n",
                 sizeof(bc), outv, strerror(errno) );
             return -1;
         }
@@ -477,7 +477,7 @@ int main( int argc, char *argv[] )
 	}
 	if ( !feof(inp) )
 	{
-		printf( "Error: Unable to read input. Expected %d bytes, got %d. Err=%s",
+		printf( "Error: Unable to read input. Expected %zu bytes, got %d. Err=%s",
             sizeof(bc), retv, strerror(errno) );
 		return 8;
 	}

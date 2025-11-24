@@ -78,9 +78,9 @@ int main(int argc, char *argv[])
 			close(fd);
 			return 1;
 		}
-		if ( sts != sizeof(reclen) )
+		if ( sts != (int)sizeof(reclen) )
 		{
-			fprintf(stderr,"Error reading record count bytes. Expected %d, got %d: %s\n", sizeof(reclen), sts, strerror(errno));
+			fprintf(stderr,"Error reading record count bytes. Expected %zu, got %d: %s\n", sizeof(reclen), sts, strerror(errno));
 			close(fd);
 			return 1;
 		}
@@ -92,7 +92,7 @@ int main(int argc, char *argv[])
 		}
 		if ( reclen < 0 || reclen > 65535 )
 		{
-			fprintf(stderr,"Fatal error decoding file. Record count of 0x%X is > 0xFFFF which is illegal. Corrupt? (sizeof(int)=%d)\n",
+			fprintf(stderr,"Fatal error decoding file. Record count of 0x%X is > 0xFFFF which is illegal. Corrupt? (sizeof(int)=%zu)\n",
 					reclen, sizeof(reclen));
 			close(fd);
 			return 1;
@@ -163,7 +163,7 @@ int main(int argc, char *argv[])
 					}
 					else if ( sts > 0 )
 					{
-						fprintf(stderr, "Error reading trailing record count bytes. Expected %d bytes, got %d: (%d)%s\n",
+						fprintf(stderr, "Error reading trailing record count bytes. Expected %zu bytes, got %d: (%d)%s\n",
 								sizeof(lastRecLen), sts, savErr, strerror(errno));
 					}
 			        break;

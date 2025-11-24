@@ -17,6 +17,10 @@ add_executable(vmsbackup_gui
   src/main.cpp
   src/MainWindow.cpp
   src/MainWindow.h
+  src/ControlsPane.cpp
+  src/ControlsPane.h
+  src/BackendRunner.cpp
+  src/BackendRunner.h
 )
 
 target_link_libraries(vmsbackup_gui PRIVATE ${QT_LIB})

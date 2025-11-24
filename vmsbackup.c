@@ -1880,22 +1880,22 @@ static int read_next_block( struct vmb_ctx *ctx )
 	return NXT_BLK_OK;			/* we've got a good record */
 }
 
-static void rdtail ( void )
+static void rdtail ( struct vmb_ctx *ctx )
 {
 	int len;
 
-	close_file_ctx(&g_ctx);
+	close_file_ctx(ctx);
 	/* read the tape label - 4 records of 80 bytes */
-	while ( ( len = read_record( &g_ctx, (unsigned char *)g_ctx.label, sizeof(g_ctx.label) ) ) != 0 )
+	while ( ( len = read_record( ctx, (unsigned char *)ctx->label, sizeof(ctx->label) ) ) != 0 )
 	{
 		if ( len != LABEL_SIZE )
 		{
 			printf ( "Snark: rdtail(): bad EOF label record. Expected %d bytes got %d.\n", LABEL_SIZE, len );
-			g_ctx.skipping |= SKIP_TO_SAVESET;
+			ctx->skipping |= SKIP_TO_SAVESET;
 			/* end_of_saveset( NULL ); TODO: restore when callback exists */
 			break;
 		}
-		if ( strncmp ( g_ctx.label, "EOF1", 4 ) == 0 )
+		if ( strncmp ( ctx->label, "EOF1", 4 ) == 0 )
 		{
 			/* end_of_saveset( label ); TODO: restore when callback exists */
 		}
@@ -2443,7 +2443,7 @@ static int vmsbackup_entry(struct vmb_ctx *ctx, int argc, char *argv[])
 			eoffl = 1;		/* we're done */
 			continue;
 		case NXT_BLK_TM:		/* reached a TM */
-			rdtail (  );		/* read EOF labels */
+			rdtail ( ctx );		/* read EOF labels */
 			freeall(ctx);		/* reset for next saveset */
 			ctx->skipping = 0;		/* not skipping anything now */
 			eoffl = 0;
