@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/Users/keith/src/VMS_Tape_Tool/vmsbackup/gui/build/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

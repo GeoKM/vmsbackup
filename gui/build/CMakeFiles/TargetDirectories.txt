@@ -1,0 +1,5 @@
+/Users/keith/src/VMS_Tape_Tool/vmsbackup/gui/build/CMakeFiles/vmsbackup_gui.dir
+/Users/keith/src/VMS_Tape_Tool/vmsbackup/gui/build/CMakeFiles/edit_cache.dir
+/Users/keith/src/VMS_Tape_Tool/vmsbackup/gui/build/CMakeFiles/rebuild_cache.dir
+/Users/keith/src/VMS_Tape_Tool/vmsbackup/gui/build/CMakeFiles/vmsbackup_gui_autogen_timestamp_deps.dir
+/Users/keith/src/VMS_Tape_Tool/vmsbackup/gui/build/CMakeFiles/vmsbackup_gui_autogen.dir

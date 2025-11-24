@@ -1,0 +1,2 @@
+set(__QT_DEPLOY_TARGET_vmsbackup_gui_FILE /Users/keith/src/VMS_Tape_Tool/vmsbackup/gui/build/vmsbackup_gui)
+set(__QT_DEPLOY_TARGET_vmsbackup_gui_TYPE EXECUTABLE)
